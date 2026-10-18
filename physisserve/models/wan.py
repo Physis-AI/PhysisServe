@@ -313,34 +313,26 @@ class WanDiT:
 
 
 class WanEncoder:
-    """UMT5 text encoder loaded from a complete Diffusers model root.
-
-    Produces the same [1, max_length, text_dim] embedding as diffusers' WanPipeline: the prompt cleaned
-    the same way, the encoder output up to the prompt's length, zero-padded to max_length.
-    """
+    """Diffusers prompt encoding with only the tokenizer and UMT5 loaded."""
 
     def __init__(self, source, max_length: int = 512):
         self.root, self.max_length = Path(source), max_length
-        self.tokenizer = self.model = None
+        self.pipeline = None
 
     def load(self, device, dtype):
+        from diffusers import WanPipeline
         from transformers import AutoTokenizer, UMT5EncoderModel
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.root / "tokenizer")
-        self.model = UMT5EncoderModel.from_pretrained(self.root / "text_encoder", torch_dtype=dtype).to(device)
-        self.model.eval().requires_grad_(False)
+        tokenizer = AutoTokenizer.from_pretrained(self.root / "tokenizer")
+        encoder = UMT5EncoderModel.from_pretrained(self.root / "text_encoder", torch_dtype=dtype).to(device)
+        encoder.eval().requires_grad_(False)
+        self.pipeline = WanPipeline(tokenizer=tokenizer, text_encoder=encoder, vae=None, scheduler=None)
         self.device = torch.device(device)
 
     def encode(self, prompt):
-        from diffusers.pipelines.wan.pipeline_wan import prompt_clean
-
-        tokens = self.tokenizer([prompt_clean(prompt)], padding="max_length", max_length=self.max_length,
-                                truncation=True, add_special_tokens=True, return_attention_mask=True,
-                                return_tensors="pt")
-        ids, mask = tokens.input_ids.to(self.device), tokens.attention_mask.to(self.device)
-        hidden = self.model(ids, mask).last_hidden_state
-        length = int(mask.gt(0).sum())
-        return {"text": torch.cat((hidden[:, :length], hidden.new_zeros(1, self.max_length - length, hidden.shape[2])), dim=1)}
+        text, _ = self.pipeline.encode_prompt(prompt, do_classifier_free_guidance=False,
+                                             max_sequence_length=self.max_length, device=self.device)
+        return {"text": text}
 
 
 class WanDecoder:

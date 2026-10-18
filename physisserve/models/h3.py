@@ -38,16 +38,8 @@ def backend(root) -> Backend:
     )
 
 
-def _patchify(latent, patch_size):
-    """[B,C,T,H,W] -> frame-major [B,patches,C*pt*ph*pw]."""
-    pt, ph, pw = patch_size
-    b, c, t, h, w = latent.shape
-    rows = latent.reshape(b, c, t // pt, pt, h // ph, ph, w // pw, pw)
-    return rows.permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(b, -1, c * pt * ph * pw)
-
-
 def _unpatchify(rows, shape, patch_size):
-    """Inverse of :func:`_patchify`."""
+    """Restore frame-major Diffusers patch rows to ``[B,C,T,H,W]``."""
     b, c, t, h, w = shape
     pt, ph, pw = patch_size
     rows = rows.reshape(b, t // pt, h // ph, w // pw, c, pt, ph, pw)
@@ -299,9 +291,12 @@ class H3DiT:
         return rotary
 
     def embed(self, latent, timestep, chunk):
+        from diffusers.modular_pipelines.minimax_h3.before_denoise import patchify_video_latents
+
         del timestep, chunk
-        video = self.model.proj_in(_patchify(latent, self.config["patch_size"]).to(
-            self.model.proj_in.weight.dtype))
+        rows = patchify_video_latents(latent, self.config["patch_size"])
+        rows = rows.reshape(latent.shape[0], -1, rows.shape[-1])
+        video = self.model.proj_in(rows.to(self.model.proj_in.weight.dtype))
         text = self.refined_text
         return torch.cat((text, video.to(text.dtype)), dim=1)
 

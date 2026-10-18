@@ -292,10 +292,10 @@ class LTX2DiT:
         return rotary
 
     def embed(self, latent, timestep, chunk):
-        b, c, t, h, w = latent.shape
-        rows = latent.permute(0, 2, 3, 4, 1).reshape(b, t * h * w, c)  # tokens in (frame, height, width) order
+        from diffusers import LTX2Pipeline
+
         with _autocast(self.device, self.dtype):
-            return self.model.proj_in(rows)
+            return self.model.proj_in(LTX2Pipeline._pack_latents(latent))
 
     def block(self, index, hidden, timestep, chunk, cache):
         temb, _, prompt = self._embedding(timestep, chunk)
@@ -359,14 +359,16 @@ class LTX2DiT:
         return list(hidden.split(batch_size, dim=0))
 
     def unembed(self, hidden, timestep, chunk):
+        from diffusers import LTX2Pipeline
+
         _, embedded, _ = self._embedding(timestep, chunk)
-        b, c, _, h, w = self.shape
+        h, w = self.shape[3:]
         t = self.geometry.frames_of(chunk)
         with _autocast(self.device, self.dtype):
             values = self.model.scale_shift_table[None, None] + embedded[:, :, None]
             shift, scale = values[:, :, 0], values[:, :, 1]
             out = self.model.proj_out(self.model.norm_out(hidden) * (1 + scale) + shift)
-        return out.reshape(b, t, h, w, c).permute(0, 4, 1, 2, 3)
+        return LTX2Pipeline._unpack_latents(out, t, h, w)
 
 
 class LTX2Encoder:
@@ -378,32 +380,30 @@ class LTX2Encoder:
 
     def __init__(self, source, max_length: int = 1024):
         self.source, self.max_length = Path(source), max_length
-        self.tokenizer = self.model = self.connectors = None
+        self.pipeline = None
 
     def load(self, device, dtype):
         import transformers
+        from diffusers import LTX2Pipeline
         from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
 
         index = json.loads((self.source / "model_index.json").read_text())
-        self.tokenizer = getattr(transformers, index["tokenizer"][1]).from_pretrained(self.source / "tokenizer")
-        self.model = getattr(transformers, index["text_encoder"][1]).from_pretrained(
+        tokenizer = getattr(transformers, index["tokenizer"][1]).from_pretrained(self.source / "tokenizer")
+        text_encoder = getattr(transformers, index["text_encoder"][1]).from_pretrained(
             self.source / "text_encoder", dtype=dtype).to(device)
-        self.connectors = LTX2TextConnectors.from_pretrained(
+        connectors = LTX2TextConnectors.from_pretrained(
             self.source, subfolder="connectors", dtype=dtype).to(device)
-        self.model.eval().requires_grad_(False)
-        self.connectors.eval().requires_grad_(False)
+        text_encoder.eval().requires_grad_(False)
+        connectors.eval().requires_grad_(False)
+        self.pipeline = LTX2Pipeline(scheduler=None, vae=None, audio_vae=None, text_encoder=text_encoder,
+                                     tokenizer=tokenizer, connectors=connectors, transformer=None, vocoder=None)
         self.device, self.dtype = torch.device(device), dtype
 
     def encode(self, prompt):
-        self.tokenizer.padding_side = "left"
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        tokens = self.tokenizer([prompt.strip()], padding="max_length", max_length=self.max_length, truncation=True,
-                                add_special_tokens=True, return_tensors="pt").to(self.device)
-        hidden = self.model(input_ids=tokens.input_ids, attention_mask=tokens.attention_mask,
-                            output_hidden_states=True).hidden_states  # the embedding layer and every transformer layer
-        stacked = torch.stack(hidden, dim=-1).flatten(2, 3).to(self.dtype)
-        video, _, mask = self.connectors(stacked, tokens.attention_mask, padding_side="left")
+        text, attention_mask, _, _ = self.pipeline.encode_prompt(
+            prompt, do_classifier_free_guidance=False, max_sequence_length=self.max_length,
+            device=self.device, dtype=self.dtype)
+        video, _, mask = self.pipeline.connectors(text, attention_mask, padding_side="left")
         return {"text": video[:, mask[0].bool()]}
 
 
@@ -428,8 +428,10 @@ class LTX2Decoder:
 
     def decode_sequence(self, latent):
         """Decode the complete latent video, matching the non-causal pipeline VAE semantics."""
+        from diffusers import LTX2Pipeline
+
         if latent.shape[1] != self.mean.shape[1]:
             raise ValueError("LTX-2.5 latent channels must match the VAE")
-        z = latent.float() * self.std / self.vae.config.scaling_factor + self.mean
+        z = LTX2Pipeline._denormalize_latents(latent.float(), self.mean, self.std, self.vae.config.scaling_factor)
         temb = torch.zeros(1, device=self.device, dtype=self.dtype) if self.vae.config.timestep_conditioning else None
         return self.vae.decode(z.to(self.dtype), temb, return_dict=False)[0].clamp(-1, 1)
