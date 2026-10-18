@@ -50,11 +50,20 @@ class PhysisServe:
 
     Multi-GPU execution starts its own processes; run scripts under a
     ``if __name__ == '__main__':`` guard. Parallelism is over denoising stages.
+    For multiple nodes, use ``torchrun ... --module physisserve.launch script.py``;
+    the launcher supplies the GPU pool size without changing the script.
     """
 
     def __init__(self, model, *, pipeline_parallel_size=1, strategy="virtual_rank",
                  max_batch_size=None, device="cuda", encoder_device="cpu",
                  batch_costs=None, admission_window=None):
+        from .launch import _workers
+
+        if _workers is not None:
+            world = dist.get_world_size()
+            if type(pipeline_parallel_size) is not int or pipeline_parallel_size not in (1, world):
+                raise ValueError("pipeline_parallel_size must be 1 or match the launch WORLD_SIZE")
+            pipeline_parallel_size = world
         self.config = Config(model, ranks=pipeline_parallel_size, strategy=strategy,
                              max_batch=max_batch_size, device=device, encoder_device=encoder_device,
                              batch_costs=batch_costs, admission_window=admission_window)
@@ -62,10 +71,13 @@ class PhysisServe:
         self._processes, self._connections = [], []
         self._rendezvous = None
         self._closed = False
-        if device == "cuda" and torch.cuda.device_count() < pipeline_parallel_size:
+        self._external = _workers
+        if _workers is None and device == "cuda" and torch.cuda.device_count() < pipeline_parallel_size:
             raise ValueError(f"requested {pipeline_parallel_size} GPUs, found {torch.cuda.device_count()}")
         try:
-            if pipeline_parallel_size == 1:
+            if _workers is not None:
+                _workers.load(self, self.config, model)
+            elif pipeline_parallel_size == 1:
                 self._engine = Engine(self.config)
             else:
                 self._rendezvous = TemporaryDirectory(prefix="physisserve-")
@@ -107,6 +119,8 @@ class PhysisServe:
         if self._closed:
             raise RuntimeError("PhysisServe is closed")
         try:
+            if self._external is not None:
+                return self._external.call(operation, *args, **kwargs)
             if self._engine is not None:
                 return [_execute(self._engine, operation, args, kwargs)]
             for connection in self._connections:
@@ -169,6 +183,9 @@ class PhysisServe:
             return
         self._closed = True
         atexit.unregister(self.close)
+        if self._external is not None:
+            self._external.release(self)
+            return
         for connection in self._connections:
             try:
                 connection.send(None)

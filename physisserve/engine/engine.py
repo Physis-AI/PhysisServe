@@ -12,23 +12,24 @@ from .transport import Distributed, Local
 
 
 class Engine:
-    def __init__(self, config):
+    def __init__(self, config, control_group=None):
         self.config = config
         self.distributed = dist.is_initialized()
         self.rank = dist.get_rank() if self.distributed else 0
         self.device = torch.device(config.device)
         if self.device.type == "cuda":
-            self.device = torch.device("cuda", self.rank)
+            self.device = torch.device("cuda", torch.cuda.current_device())
             torch.cuda.set_device(self.device)
         if (dist.get_world_size() if self.distributed else 1) != config.ranks:
             raise ValueError("initialize exactly config.ranks processes before constructing the engine")
-        self.control_group = None
+        self.control_group = control_group
         if self.distributed:
             if dist.get_backend() == "nccl":
                 # Initialize the full communicator before any subset starts P2P.
                 dist.barrier(device_ids=[self.device.index])
-            self.control_group = (dist.group.WORLD if dist.get_backend() == "gloo" else
-                                  dist.new_group(backend="gloo", timeout=timedelta(minutes=30)))
+            if self.control_group is None:
+                self.control_group = (dist.group.WORLD if dist.get_backend() == "gloo" else
+                                      dist.new_group(backend="gloo", timeout=timedelta(minutes=30)))
         self.dtype = getattr(torch, config.dtype)
         self.codec_dtype = getattr(torch, config.compute_dtype or config.dtype)
         backend = config.make_backend(config.model)

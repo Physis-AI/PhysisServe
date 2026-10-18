@@ -81,6 +81,9 @@ def summarize(rank_results, streams, chunks, repeats, skip_chunks):
 
 
 def main():
+    # Worker callbacks must be importable when only rank zero runs this script.
+    from bench import measure
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", help="Diffusers directory or Hugging Face repository")
     parser.add_argument("--gpus", type=int, default=1)
