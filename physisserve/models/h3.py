@@ -17,7 +17,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .base import Backend, block_indices, drop_attributes, load_selected_weights
-from .batching import BatchCache, validate_batch
+from .batching import BatchCache
 
 
 def backend(root, text_length=None) -> Backend:
@@ -338,8 +338,7 @@ class H3DiT:
         restores their batch dimension before attention and publishes separate
         pre-RoPE video pages. Text remains in each member's hidden packet.
         """
-        pages = validate_batch(self, index, hidden_list, timestep_list, chunk_list, cache_list,
-                               self.model.transformer_blocks if self.model is not None else None)
+        pages = len(cache_list[0].history)
         members = len(hidden_list)
         expected = self.hidden_shape(self.shape)
         if any(not 0.0 <= float(timestep) <= 1.0 for timestep in timestep_list):

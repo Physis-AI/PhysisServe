@@ -6,7 +6,6 @@ from tempfile import mkdtemp
 import torch
 import torch.distributed as dist
 
-from ..sampling_params import Request
 from .model_runner import ModelRunner, _request_schedules, _request_ticks
 from .strategies.placement import MappedLayout
 from .transport import Distributed, Local
@@ -67,8 +66,6 @@ class Engine:
         self._check_idle()
         self.prepared = False
         self.requests, self.sessions = tuple(requests), ()
-        if any(not isinstance(request, Request) for request in self.requests):
-            raise TypeError("requests must contain Request objects")
         if not self.supports_stream_decode and any(r.mode == "stream_decode" for r in self.requests):
             raise ValueError("this VAE requires whole-sequence decoding; use deferred_decode")
         ids = {str(index) for index in range(len(self.requests))}

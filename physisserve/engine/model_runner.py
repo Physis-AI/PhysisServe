@@ -203,8 +203,6 @@ class ModelRunner:
             with torch.inference_mode():
                 done = {}
                 for batch in planned_batches[tick]:
-                    if any((task.rank, task.block) != (batch[0].rank, batch[0].block) for task in batch):
-                        raise ValueError("a batch must use one rank and one block")
                     groups = {}
                     for task in batch:
                         cache = kv.context(task)

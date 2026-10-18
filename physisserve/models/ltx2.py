@@ -17,7 +17,7 @@ from torch.nn import functional as F
 
 from ..engine.chunks import Chunks
 from .base import Backend, block_indices, drop_attributes, load_selected_weights
-from .batching import BatchCache, validate_batch
+from .batching import BatchCache
 
 
 
@@ -362,8 +362,7 @@ class LTX2DiT:
         and feed-forward run once over the combined batch. Unequal history lengths are grouped
         by the engine before entry; this method never substitutes serial block calls.
         """
-        history_length = validate_batch(self, index, hidden_list, timestep_list, chunk_list, cache_list,
-                                        self.model.transformer_blocks if self.model is not None else None)
+        history_length = len(cache_list[0].history)
         members = len(hidden_list)
         embeddings = [self._embedding(timestep, chunk) for timestep, chunk in zip(timestep_list, chunk_list)]
         temb = torch.cat([embedding[0] for embedding in embeddings], dim=0)

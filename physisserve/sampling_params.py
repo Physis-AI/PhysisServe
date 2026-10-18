@@ -51,6 +51,8 @@ class SamplingParams:
 
 @dataclass(frozen=True)
 class Request:
+    """Internal request built from validated sampling parameters and model defaults."""
+
     prompt: str
     shape: tuple[int, ...]
     chunks: int
@@ -58,14 +60,3 @@ class Request:
     fps: int
     mode: str = "dit_only"
     latent_dir: str | Path | None = None
-
-    def __post_init__(self):
-        object.__setattr__(self, "shape", tuple(self.shape))
-        if (len(self.shape) != 5 or any(type(n) is not int or n < 1 for n in self.shape)
-                or self.shape[0] != 1 or self.shape[2] != 1):
-            raise ValueError("shape must be (1, channels, 1, height, width)")
-        if not isinstance(self.prompt, str):
-            raise TypeError("prompt must be a string")
-        params = SamplingParams(num_chunks=self.chunks, fps=self.fps, seed=self.seed,
-                                mode=self.mode, latent_dir=self.latent_dir)
-        object.__setattr__(self, "latent_dir", params.latent_dir)

@@ -16,7 +16,7 @@ from torch.nn import functional as F
 
 from ..engine.chunks import Chunks
 from .base import Backend, block_indices, load_selected_weights
-from .batching import BatchCache, validate_batch
+from .batching import BatchCache
 
 
 def backend(root, text_length=None, cache_text_kv=False) -> Backend:
@@ -316,8 +316,7 @@ class WanDiT:
         effective positions and published pages remain pre-RoPE. Each returned tensor has the
         prepared hidden shape (including its original batch dimension).
         """
-        history = validate_batch(self, index, hidden_list, timestep_list, chunk_list, cache_list,
-                                 self.model.blocks if self.model is not None else None)
+        history = len(cache_list[0].history)
         embeddings = [self._embedding(timestep) for timestep in timestep_list]
         modulation = torch.cat([embedding[1] for embedding in embeddings], dim=0)
         text = self._batch_text([embedding[2] for embedding in embeddings])

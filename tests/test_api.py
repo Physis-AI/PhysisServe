@@ -176,13 +176,13 @@ def test_h3_short_chunks_allowed_only_for_dit_mode():
     assert calls == []
 
 
-def test_request_rejects_batched_or_multi_latent_input():
-    with pytest.raises(ValueError, match="shape"):
-        Request("cat", (1, 16, 3, 60, 104), 5, 0, 16)
-    with pytest.raises(ValueError, match="shape"):
-        Request("cat", (2, 16, 1, 60, 104), 5, 0, 16)
-    with pytest.raises(ValueError, match="mode"):
-        Request("cat", (1, 16, 1, 60, 104), 5, 0, 16, mode="video")
+@pytest.mark.parametrize("prompt", [None, 42, ["nested"]])
+def test_invalid_prompt_rejected_before_worker_call(prompt):
+    model = PhysisServe.__new__(PhysisServe)
+    model.config = fake_config("fake")
+    model._call = lambda *args, **kwargs: pytest.fail("invalid input must fail before worker calls")
+    with pytest.raises(TypeError, match="prompt.*string"):
+        model.generate([prompt])
 
 
 def test_complete_diffusers_model_generates_decodable_video(tmp_path):
