@@ -174,13 +174,11 @@ class WanDiT:
 
     def prepare(self, condition, shape, chunks, fps=None):
         shape = tuple(shape)
-        cfg, b, _, _, h, w = self.config, *shape
+        cfg = self.config
         _, ph, pw = cfg["patch_size"]
-        text = condition.get("text")
-        if text is None or text.ndim != 3 or text.shape[0] != b or text.shape[2] != cfg["text_dim"]:
-            raise ValueError("condition['text'] must be [B, L, text_dim]")
+        text = condition["text"]
         self.geometry = Chunks(shape, chunks, self.first_frames)
-        required = max(self.geometry.total, h // ph, w // pw)
+        required = max(self.geometry.total, shape[3] // ph, shape[4] // pw)
         rope = self.model.rope
         if required > rope.freqs_cos.shape[0]:
             from diffusers.models.transformers.transformer_wan import WanRotaryPosEmbed
@@ -285,8 +283,6 @@ class WanDiT:
         as the contiguous frames ending with the chunk, so the history is always read as the frames just before it
         (a sink chunk is relocated; a contiguous recent history keeps its absolute positions)."""
         if (chunk, pages) not in self.rotary:
-            if not 0 <= pages <= chunk:
-                raise ValueError("Wan cache has more history pages than preceding chunks")
             # Positions count latent frames, so a first chunk of its own length lays out the same way.
             geometry = self.geometry
             start = geometry.start(chunk)

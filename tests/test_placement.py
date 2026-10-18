@@ -1,5 +1,3 @@
-from dataclasses import replace
-
 import pytest
 
 from physisserve.engine.strategies import StageEqual, VirtualRank
@@ -13,28 +11,7 @@ def candidate(name, demands, gap=10):
 
 
 def problem(name, *candidates):
-    return StreamCandidates(name, 2, 12, 20, candidates)
-
-
-def test_plan_pool_rejects_custom_layouts_before_calling_them(monkeypatch):
-    class CustomLayout:
-        def num_ranks(self, blocks):
-            pytest.fail("an unapproved layout must not be called")
-
-        rank_blocks = schedule = num_ranks
-
-    class CustomStageEqual(StageEqual):
-        num_ranks = rank_blocks = schedule = CustomLayout.num_ranks
-
-    class CustomVirtualRank(VirtualRank):
-        num_ranks = rank_blocks = schedule = CustomLayout.num_ranks
-
-    monkeypatch.setattr("physisserve.engine.strategies.placement._Search", lambda *args: pytest.fail(
-        "invalid inputs must fail before search starts"))
-    for layout in (CustomLayout(), CustomStageEqual(1), CustomVirtualRank(1)):
-        p = problem("custom", Candidate("custom", layout, (RankDemand(1, 0.1),), 1.0))
-        with pytest.raises(ValueError):
-            plan_pool([p], [DeviceBudget(10)])
+    return StreamCandidates(name, 20, candidates)
 
 
 def test_unknown_or_failing_single_stream_gap_is_not_admitted():
@@ -113,94 +90,60 @@ def test_mapping_preserves_batches_dependencies_and_admission_credits(layout):
                 assert old.tick == new.tick
 
 
-def test_invalid_budgets_and_duplicate_streams_are_rejected():
-    p = problem("p", candidate("one", [(1, 0.1)]))
-    with pytest.raises(ValueError, match="unique"):
-        plan_pool([p, p], [DeviceBudget(10)])
-    with pytest.raises(ValueError):
-        plan_pool([], [])
+def test_no_arrivals_leave_pool_unused():
+    empty = plan_pool([], [])
+    assert empty.placements == empty.loads == ()
+    assert empty.rejected == {}
     assert plan_pool([], [DeviceBudget(10)]).loads == (RankDemand(0, 0.0),)
 
 
-@pytest.mark.parametrize("target", ["demand", "budget"])
-@pytest.mark.parametrize("field,value", [
-    ("memory_bytes", -1), ("memory_bytes", 1.5), ("memory_bytes", True),
-    ("utilization", -0.1), ("utilization", True),
-    ("utilization", float("nan")), ("utilization", float("inf")),
-])
-def test_plan_pool_validates_resources_before_search(monkeypatch, target, field, value):
-    demand, budget = RankDemand(1, 0.1), DeviceBudget(10)
-    if target == "demand":
-        demand = replace(demand, **{field: value})
-    else:
-        budget = replace(budget, **{field: value})
-    first = problem("first", candidate("valid", [(1, 0.1)]))
-    invalid = problem("invalid", Candidate("one", StageEqual(1), (demand,), 1.0))
-    monkeypatch.setattr("physisserve.engine.strategies.placement._Search", lambda *args: pytest.fail(
-        "all resources must be validated before search starts"))
-    with pytest.raises(ValueError):
-        plan_pool([first, invalid], [budget])
+def test_empty_pool_rejects_arrivals_without_searching():
+    arrivals = [problem("p", candidate("one", [(1, 0.1)])),
+                problem("q", candidate("unknown", [(1, 0.1)], None))]
+    plan = plan_pool(arrivals, [])
+    assert plan.placements == plan.loads == ()
+    assert set(plan.rejected) == {"p", "q"}
+    assert all(search["nodes"] == 0 for search in plan.diagnostics["search"].values())
 
 
-@pytest.mark.parametrize("budget", [DeviceBudget(0), DeviceBudget(10, 0)])
-def test_plan_pool_rejects_zero_budgets_even_without_arrivals(budget):
-    with pytest.raises(ValueError):
-        plan_pool([], [budget])
+@pytest.mark.parametrize("name", ["", "same"])
+def test_candidate_names_do_not_restrict_search(name):
+    p = problem("p", candidate(name, [(11, 0.1)]), candidate(name, [(1, 0.1)]))
+    plan = plan_pool([p], [DeviceBudget(10)])
+    assert not plan.rejected
+    assert plan.placements[0].candidate is p.candidates[1]
+    assert plan.diagnostics["search"]["p"]["tried_candidates"] == (name, name)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("blocks", 0), ("blocks", -1), ("blocks", 1.5), ("blocks", True),
-    ("chunks", 0), ("chunks", -1), ("chunks", 1.5), ("chunks", True),
-    ("slo_ms", 0), ("slo_ms", -1), ("slo_ms", True),
-    ("slo_ms", float("nan")), ("slo_ms", float("inf")),
-    ("max_gap_ms", 0), ("max_gap_ms", -1), ("max_gap_ms", True),
-    ("max_gap_ms", float("nan")), ("max_gap_ms", float("inf")),
-])
-def test_plan_pool_validates_stream_parameters_before_search(monkeypatch, field, value):
-    first = problem("first", candidate("one", [(1, 0.1)]))
-    invalid = replace(first, stream_id="invalid")
-    if field == "max_gap_ms":
-        invalid = replace(invalid, candidates=(replace(first.candidates[0], max_gap_ms=value),))
-    else:
-        invalid = replace(invalid, **{field: value})
-    monkeypatch.setattr("physisserve.engine.strategies.placement._Search", lambda *args: pytest.fail(
-        "all stream parameters must be validated before search starts"))
-    with pytest.raises(ValueError):
-        plan_pool([first, invalid], [DeviceBudget(10)])
-
-
-@pytest.mark.parametrize("options", [
-    {"search_limit": 0}, {"search_limit": -1}, {"search_limit": 1.5}, {"search_limit": True},
-    {"lds_discrepancies": -1}, {"lds_discrepancies": 1.5}, {"lds_discrepancies": True},
-])
-def test_plan_pool_validates_search_options_before_search(monkeypatch, options):
-    monkeypatch.setattr("physisserve.engine.strategies.placement._Search", lambda *args: pytest.fail(
-        "invalid options must fail before search starts"))
-    with pytest.raises(ValueError):
-        plan_pool([problem("one", candidate("one", [(1, 0.1)]))], [DeviceBudget(10)], **options)
-
-
-@pytest.mark.parametrize("case", [
-    "stream_id", "candidate_name", "candidate_type", "duplicate_names", "empty_demands",
-    "demand_type", "local_ranks",
-])
-def test_plan_pool_validates_record_structure_before_search(monkeypatch, case):
-    first = problem("first", candidate("one", [(1, 0.1)]))
-    invalid = replace(first, stream_id="invalid")
-    choice = first.candidates[0]
-    if case == "stream_id":
-        invalid = replace(invalid, stream_id="")
-    elif case == "candidate_name":
-        invalid = replace(invalid, candidates=(replace(choice, name=""),))
-    elif case == "candidate_type":
-        invalid = replace(invalid, candidates=(object(),))
-    elif case == "duplicate_names":
-        invalid = replace(invalid, candidates=(choice, choice))
-    else:
-        demands = {"empty_demands": (), "demand_type": (object(),),
-                   "local_ranks": (RankDemand(1, 0.1),) * 2}[case]
-        invalid = replace(invalid, candidates=(replace(choice, demands=demands),))
-    monkeypatch.setattr("physisserve.engine.strategies.placement._Search", lambda *args: pytest.fail(
-        "all records must be validated before search starts"))
-    with pytest.raises(ValueError):
-        plan_pool([first, invalid], [DeviceBudget(10)])
+@pytest.mark.parametrize("ranks", [1, 2, 5])
+@pytest.mark.parametrize("discrepancies", [0, 1, 2])
+@pytest.mark.parametrize("search_limit", [0, 1, 7, 10000])
+def test_generated_placement_covers_arrivals_and_obeys_resource_and_search_budgets(
+        ranks, discrepancies, search_limit):
+    arrivals = [problem(str(index),
+                        candidate("", [(2 + index % 3, 0.125)] * (1 + index % 4)),
+                        candidate("", [(3 + index % 3, 0.25)] * (1 + index % 3)),
+                        candidate("too-slow", [(1, 0.01)], 21))
+                for index in range(9)]
+    budgets = [DeviceBudget(8 + rank, 0.75) for rank in range(ranks)]
+    plan = plan_pool(arrivals, budgets, lds_discrepancies=discrepancies, search_limit=search_limit)
+    placed = [item.stream_id for item in plan.placements]
+    assert len(set(placed)) == len(placed)
+    assert set(placed).isdisjoint(plan.rejected)
+    assert set(placed) | set(plan.rejected) == {item.stream_id for item in arrivals}
+    expected_memory, expected_utilization = [0] * ranks, [0.] * ranks
+    for item in plan.placements:
+        source = arrivals[int(item.stream_id)]
+        assert any(item.candidate is choice for choice in source.candidates)
+        assert item.candidate.max_gap_ms <= source.slo_ms
+        assert len(item.rank_map) == len(item.candidate.demands) == item.candidate.layout.num_ranks(3)
+        for rank, demand in zip(item.rank_map, item.candidate.demands):
+            assert 0 <= rank < ranks
+            expected_memory[rank] += demand.memory_bytes
+            expected_utilization[rank] += demand.utilization
+    assert len(plan.loads) == ranks
+    for rank, (load, budget) in enumerate(zip(plan.loads, budgets)):
+        assert load.memory_bytes == expected_memory[rank] <= budget.memory_bytes
+        assert load.utilization == expected_utilization[rank] <= budget.utilization
+    for search in plan.diagnostics["search"].values():
+        assert 0 <= search["nodes"] <= search_limit

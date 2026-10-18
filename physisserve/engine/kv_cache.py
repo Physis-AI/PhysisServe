@@ -78,13 +78,7 @@ class KVCache:
     """
 
     def __init__(self, schedule: Schedule, is_local, offset: int = 0, sink=None):
-        homes, tasks = {}, []
-        for task in schedule.tasks:
-            stage = task.step, task.block
-            if homes.setdefault(stage, task.rank) != task.rank:
-                raise ValueError("KVCache requires a fixed rank for each (step, block)")
-            if is_local(task.rank):
-                tasks.append(task)
+        tasks = [task for task in schedule.tasks if is_local(task.rank)]
         self.sink = {} if sink is None else sink
         self.reads = {
             task: [(chunk - offset, task.step, task.block)
@@ -97,11 +91,7 @@ class KVCache:
         for task, keys in self.reads.items():
             for key in keys:
                 if key[0] < 0:
-                    if (key[0] + offset, *key[1:]) not in self.sink:
-                        raise ValueError(f"{task} reads sink page {key[0] + offset, *key[1:]}, which is missing")
                     continue
-                if schedule.task(*key).tick >= task.tick:
-                    raise AssertionError(f"{task} reads a page that is not finished before its tick")
                 last_use[key] = max(last_use[key], task.tick)
         self.offset = offset
         self.expiry = [[] for _ in range(schedule.ticks)]

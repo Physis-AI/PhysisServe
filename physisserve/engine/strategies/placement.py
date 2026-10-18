@@ -1,8 +1,6 @@
 """Best-Fit placement with bounded discrepancy search over fixed stream layouts."""
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from math import isfinite
-from numbers import Real
 
 from ..scheduler import Task
 from .base import BatchSchedule
@@ -33,8 +31,6 @@ class Candidate:
 @dataclass(frozen=True)
 class StreamCandidates:
     stream_id: str
-    blocks: int
-    chunks: int
     slo_ms: float
     candidates: tuple[Candidate, ...]
 
@@ -52,60 +48,6 @@ class PoolPlan:
     rejected: dict[str, str]
     loads: tuple[RankDemand, ...]
     diagnostics: dict = field(default_factory=dict)
-
-    @property
-    def num_ranks(self):
-        return len(self.loads)
-
-    def validate(self, ranks, blocks, streams):
-        if (not isinstance(self.placements, (list, tuple)) or not isinstance(self.rejected, dict)
-                or not isinstance(self.loads, (list, tuple))
-                or any(not isinstance(reason, str) for reason in self.rejected.values())):
-            raise ValueError("placement requires placement/load sequences and string rejection reasons")
-        if self.num_ranks != ranks:
-            raise ValueError("placement must use the configured GPU pool")
-        if any(type(item) is not StreamPlacement or not isinstance(item.stream_id, str)
-               or not item.stream_id for item in self.placements):
-            raise ValueError("placements must contain StreamPlacement objects with nonempty stream IDs")
-        placed = [item.stream_id for item in self.placements]
-        if (len(set(placed)) != len(placed) or set(placed) & set(self.rejected)
-                or set(placed) | set(self.rejected) != {str(index) for index in range(streams)}):
-            raise ValueError("placement must cover every input index exactly once")
-        for item in self.placements:
-            if type(item.candidate) is not Candidate or type(item.candidate.layout) not in (StageEqual, VirtualRank):
-                raise ValueError("placement requires a Candidate with StageEqual or VirtualRank layout")
-            if (not isinstance(item.rank_map, (list, tuple))
-                    or len(item.rank_map) != item.candidate.layout.num_ranks(blocks)):
-                raise ValueError("rank_map must cover exactly the single-stream local ranks")
-            if any(type(rank) is not int or not 0 <= rank < ranks for rank in item.rank_map):
-                raise ValueError("mapped ranks must be integers inside the pool")
-
-
-def _validate_candidates(candidates, blocks):
-    # Profiling metadata is consumed by plan_pool, not by execution.
-    if not isinstance(candidates, (list, tuple)):
-        raise ValueError("candidates must be a list or tuple")
-    names = set()
-    for candidate in candidates:
-        if type(candidate) is not Candidate or not isinstance(candidate.name, str) or not candidate.name:
-            raise ValueError("candidates must contain Candidate objects with nonempty names")
-        if candidate.name in names:
-            raise ValueError("candidate names must be unique within a stream")
-        names.add(candidate.name)
-        if type(candidate.layout) not in (StageEqual, VirtualRank):
-            raise ValueError("layout must be StageEqual or VirtualRank")
-        if not isinstance(candidate.demands, (list, tuple)) or not candidate.demands:
-            raise ValueError("demands must contain one RankDemand per local rank")
-        for demand in candidate.demands:
-            if (type(demand) is not RankDemand or type(demand.memory_bytes) is not int or demand.memory_bytes < 0
-                    or isinstance(demand.utilization, bool) or not isinstance(demand.utilization, Real)
-                    or not isfinite(demand.utilization) or demand.utilization < 0):
-                raise ValueError("demands must contain nonnegative integer memory and finite nonnegative utilization")
-        gap = candidate.max_gap_ms
-        if gap is not None and (isinstance(gap, bool) or not isinstance(gap, Real) or not isfinite(gap) or gap <= 0):
-            raise ValueError("max_gap_ms must be a finite positive number")
-        if candidate.layout.num_ranks(blocks) != len(candidate.demands):
-            raise ValueError("demands must cover exactly the layout's local ranks")
 
 
 def _fits(load, demand, budget):
@@ -129,7 +71,7 @@ class _Search:
         self.limit, self.nodes, self.exhausted = limit, 0, False
 
     def visit(self):
-        if self.nodes == self.limit:
+        if self.nodes >= self.limit:
             self.exhausted = True
             return False
         self.nodes += 1
@@ -143,6 +85,8 @@ def _pooled_map(candidate, loads, budgets, discrepancies, search):
     j discrepancies. Prior streams are immutable; all tentative current-stream
     work stays in this function and is discarded on failure.
     """
+    if not budgets:
+        return None
     work = list(loads)
     rank_map = [-1] * len(candidate.demands)
     largest_memory = max(budget.memory_bytes for budget in budgets)
@@ -186,34 +130,11 @@ def plan_pool(problems: Sequence[StreamCandidates], budgets: Sequence[DeviceBudg
               lds_discrepancies=2, search_limit=10000) -> PoolPlan:
     """Place arrivals without moving accepted streams. Demands are summed per GPU.
 
-    Validate all input records before searching. Input max_gap_ms must be measured
-    for each candidate; pooled execution must still satisfy the caller's delivery
-    target. Search is bounded per arrival.
+    Internal candidates contain measured max_gap_ms and per-rank demands.
+    Pooled execution must still be measured against the delivery target.
+    Search is bounded per arrival; unsuccessful arrivals leave loads unchanged.
     """
-    if type(lds_discrepancies) is not int or lds_discrepancies < 0:
-        raise ValueError("lds_discrepancies must be a nonnegative integer")
-    if type(search_limit) is not int or search_limit < 1:
-        raise ValueError("search_limit must be a positive integer")
     budgets = tuple(budgets)
-    if not budgets:
-        raise ValueError("budgets must contain at least one DeviceBudget")
-    for budget in budgets:
-        if (type(budget) is not DeviceBudget or type(budget.memory_bytes) is not int or budget.memory_bytes <= 0
-                or isinstance(budget.utilization, bool) or not isinstance(budget.utilization, Real)
-                or not isfinite(budget.utilization) or budget.utilization <= 0):
-            raise ValueError("budgets must contain positive integer memory and finite positive utilization")
-    problems = tuple(problems)
-    for problem in problems:
-        if type(problem) is not StreamCandidates or not isinstance(problem.stream_id, str) or not problem.stream_id:
-            raise ValueError("problems must contain StreamCandidates with nonempty stream IDs")
-        if any(type(value) is not int or value < 1 for value in (problem.blocks, problem.chunks)):
-            raise ValueError("blocks and chunks must be positive integers")
-        if (isinstance(problem.slo_ms, bool) or not isinstance(problem.slo_ms, Real)
-                or not isfinite(problem.slo_ms) or problem.slo_ms <= 0):
-            raise ValueError("slo_ms must be a finite positive number")
-        _validate_candidates(problem.candidates, problem.blocks)
-    if len({problem.stream_id for problem in problems}) != len(problems):
-        raise ValueError("stream IDs must be unique")
     loads = [RankDemand(0, 0.0) for _ in budgets]
     placements, rejected, searches = [], {}, {}
     for problem in problems:

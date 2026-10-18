@@ -152,12 +152,9 @@ class LTX2DiT:
     def prepare(self, condition, shape, chunks, fps=None):
         """Prepare the fixed 3-latent head followed by one-latent steady chunks."""
         shape = tuple(shape)
-        cfg = self.config
         b = shape[0]
         self.fps = float(fps)
-        text = condition.get("text")
-        if text is None or text.ndim != 3 or text.shape[0] != b or text.shape[2] != cfg["cross_attention_dim"]:
-            raise ValueError("condition['text'] must be [B, L, cross_attention_dim] (the connectors' video output)")
+        text = condition["text"]
         rope = self.model.rope
         self.shape = shape
         self.geometry = Chunks(shape, chunks, self.first_frames)
@@ -236,8 +233,6 @@ class LTX2DiT:
         """(cos, sin) of the current chunk, and of [history pages | current] laid out contiguously before it."""
         key = (chunk, pages)
         if key not in self.rotary:
-            if not 0 <= pages <= chunk:
-                raise ValueError("LTX cache has more history pages than preceding chunks")
             # Positions count latent frames, so a first chunk of its own length lays out the same way.
             geometry = self.geometry
             start = geometry.start(chunk)
@@ -442,10 +437,8 @@ class LTX2Decoder:
 
     def decode_sequence(self, latent):
         """Decode the complete latent video, matching the non-causal pipeline VAE semantics."""
-        if self.vae is None:
-            raise RuntimeError("load() must be called before decode_sequence()")
-        if latent.ndim != 5 or latent.shape[1] != self.mean.shape[1]:
-            raise ValueError(f"LTX-2.5 sequence latents must have shape [B,{self.mean.shape[1]},T,H,W]")
+        if latent.shape[1] != self.mean.shape[1]:
+            raise ValueError("LTX-2.5 latent channels must match the VAE")
         z = latent.float() * self.std / self.vae.config.scaling_factor + self.mean
         temb = torch.zeros(1, device=self.device, dtype=self.dtype) if self.vae.config.timestep_conditioning else None
         return self.vae.decode(z.to(self.dtype), temb, return_dict=False)[0].clamp(-1, 1)

@@ -8,7 +8,8 @@ import torch
 from physisserve.engine.kv_cache import KVCache, history_chunks
 from physisserve.engine.sampler import DENOISING_STEPS
 from physisserve.engine.strategies import VirtualRank, StageEqual
-from physisserve.engine.scheduler import Schedule, Task
+from physisserve.engine.scheduler import Schedule
+from physisserve.engine.strategies.placement import MappedLayout
 
 
 def assert_dag(layout, blocks, chunks):
@@ -19,8 +20,13 @@ def assert_dag(layout, blocks, chunks):
     assert set(schedule.task_of) == expected
     assert len(schedule.tasks) == len(expected)
     assert schedule.ticks == max(task.tick for task in schedule.tasks) + 1
+    assert schedule.tasks == sorted(task for tick in schedule.by_tick for task in tick)
     owners = {}
     for task in schedule.tasks:
+        assert all(type(value) is int for value in
+                   (task.tick, task.rank, task.chunk, task.step, task.block))
+        assert 0 <= task.rank < layout.num_ranks(blocks)
+        assert schedule.task(*task.key) == task
         assert task.block in layout.rank_blocks(task.rank, blocks)
         assert owners.setdefault((task.step, task.block), task.rank) == task.rank
         following = schedule.successor(task)
@@ -28,6 +34,9 @@ def assert_dag(layout, blocks, chunks):
             assert following.tick > task.tick
         if task.chunk:
             assert schedule.task(task.chunk - 1, task.step, task.block).tick < task.tick
+        if (schedule.admission_window is not None and task.step == task.block == 0
+                and task.chunk >= schedule.admission_window):
+            assert schedule.output(task.chunk - schedule.admission_window).tick < task.tick
     for tick, batches in enumerate(schedule.by_tick_batches):
         assert [task for batch in batches for task in batch] == schedule.by_tick[tick]
         for batch in batches:
@@ -55,6 +64,30 @@ LAYOUTS = [StageEqual(), StageEqual(3),
 def test_stage_equal_keeps_contiguous_balanced_ownership(blocks, ranks, counts):
     owners = StageEqual(ranks)._stage_owners(blocks)
     assert owners == tuple(rank for rank, count in enumerate(counts) for _ in range(count))
+
+
+@pytest.mark.parametrize("blocks", [1, 2, 3, 5])
+@pytest.mark.parametrize("chunks", [1, 3, 23])
+def test_stage_equal_schedules_cover_dag_with_singleton_rank_ticks(blocks, chunks):
+    for ranks in range(1, DENOISING_STEPS * blocks + 1):
+        schedule = assert_dag(StageEqual(ranks), blocks, chunks)
+        for tick in schedule.by_tick:
+            assert len({task.rank for task in tick}) == len(tick)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("pooled_ranks", [1, 2, 7])
+def test_remapped_schedules_keep_coverage_dependencies_and_kv_homes(layout, pooled_ranks):
+    blocks, chunks = 3, 26
+    rank_map = tuple(rank % pooled_ranks for rank in range(layout.num_ranks(blocks)))
+    mapped = MappedLayout(layout, rank_map, pooled_ranks)
+    schedule = assert_dag(mapped, blocks, chunks)
+    original = layout.schedule(blocks, chunks)
+    for source_tick, target_tick in zip(original.by_tick_batches, schedule.by_tick_batches):
+        assert len(source_tick) == len(target_tick)
+        for source, target in zip(source_tick, target_tick):
+            assert [task.key for task in source] == [task.key for task in target]
+            assert all(mapped.rank_map[left.rank] == right.rank for left, right in zip(source, target))
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
@@ -148,10 +181,11 @@ def test_fixed_home_cache_does_not_retain_global_schedule(local):
     assert {task.key for task in kv.reads} == expected_keys
 
 
-@pytest.mark.parametrize("local", [lambda rank: True, lambda rank: rank == 0, lambda rank: False],
-                         ids=["simulation", "one-rank", "unowned-stage"])
-def test_chunk_dependent_ownership_is_rejected(local):
-    schedule = Schedule([Task(chunk * 4 + step, chunk % 2, chunk, step, 0)
-                         for chunk in range(6) for step in range(4)], blocks=1)
-    with pytest.raises(ValueError, match=r"fixed rank for each \(step, block\)"):
-        KVCache(schedule, local)
+def test_missing_sink_or_unpublished_history_fails_when_read():
+    schedule = StageEqual(1).schedule(1, 2)
+    kv = KVCache(schedule, lambda rank: True, offset=1)
+    with pytest.raises(KeyError):
+        kv.context(schedule.task(0, 0, 0))
+    kv = KVCache(schedule, lambda rank: True)
+    with pytest.raises(KeyError):
+        kv.context(schedule.task(1, 0, 0))

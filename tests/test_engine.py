@@ -10,7 +10,7 @@ from physisserve.engine.engine import Engine
 from physisserve.engine.kv_cache import BatchCache, Cache
 from physisserve.engine.sampler import Sampler
 from physisserve.engine.strategies import StageEqual, VirtualRank
-from physisserve.engine.strategies.placement import Candidate, PoolPlan, RankDemand, StreamPlacement
+from physisserve.engine.strategies.placement import Candidate, DeviceBudget, RankDemand, StreamCandidates
 from physisserve.sampling_params import Request
 
 
@@ -139,7 +139,7 @@ class FakeConfig:
         return StageEqual(self.ranks) if self.strategy == "stage_equal" else VirtualRank(self.ranks)
 
     def make_sampler(self):
-        return Sampler.grid()
+        return Sampler((1.0, 0.75, 0.5, 0.25, 0.0), (1000.0, 750.0, 500.0, 250.0))
 
 
 def requests():
@@ -208,15 +208,36 @@ def test_placement_preserves_input_order_and_reports_rejections_without_loading(
     config = FakeConfig()
     engine = Engine(config)
     candidate = Candidate("one", StageEqual(1), (RankDemand(1, 0.1),), 1.0)
-    plan = PoolPlan((StreamPlacement("1", candidate, (0,)),), {"0": "pool full"}, (RankDemand(1, 0.1),))
-    engine.prepare(requests(), plan)
+    too_large = Candidate("two", StageEqual(1), (RankDemand(2, 0.1),), 1.0)
+    candidates = [StreamCandidates("0", 2.0, (too_large,)), StreamCandidates("1", 2.0, (candidate,))]
+    engine.prepare(requests(), candidates, [DeviceBudget(1)])
     results = engine.run()
-    assert results[0] == {"prompt": "cat", "fps": 16, "status": "rejected", "reason": "pool full"}
+    assert results[0] == {"prompt": "cat", "fps": 16, "status": "rejected",
+                          "reason": "no placement found by this bounded policy; infeasibility not proved"}
     assert results[1]["prompt"] == "dog" and results[1]["latents"].shape[2] == 6
     assert len(config.loaded) == 1 and config.encoded == ["dog"]
     assert engine.decode(results)[0] == results[0]
     engine.prepare([])
     assert engine.run() == [] and not engine.runners
+
+
+@pytest.mark.parametrize("layout", [StageEqual(2), VirtualRank(2)])
+def test_internal_pool_colocates_stream_stages_without_changing_single_stream_latents(layout):
+    single = Engine(FakeConfig("stage_equal"))
+    expected = []
+    for request in requests():
+        single.prepare([request])
+        expected.append(single.run()[0]["latents"])
+
+    candidate = Candidate("two ranks", layout, (RankDemand(1, 0.1),) * 2, 1.0)
+    candidates = [StreamCandidates(str(index), 2.0, (candidate,)) for index in range(2)]
+    engine = Engine(FakeConfig())
+    engine.prepare(requests(), candidates, [DeviceBudget(4)])
+    assert all(runner.layout.rank_map == (0, 0) for _, runner in engine.runners.values())
+    outputs = engine.run()
+    assert [output["prompt"] for output in outputs] == [request.prompt for request in requests()]
+    for output, latent in zip(outputs, expected):
+        torch.testing.assert_close(output["latents"], latent, rtol=0, atol=0)
 
 
 def test_unprepared_engine_and_decoder_shapes_fail_explicitly(monkeypatch):
@@ -280,9 +301,9 @@ def distributed_worker(rank, rendezvous):
         engine = Engine(config)
         # Rank zero receives every output even when it owns no model blocks.
         candidate = Candidate("one", StageEqual(1), (RankDemand(1, 0.1),), 1.0)
-        plan = PoolPlan(tuple(StreamPlacement(str(index), candidate, (1,)) for index in range(2)),
-                        {}, (RankDemand(0, 0.0), RankDemand(2, 0.2)))
-        engine.prepare(requests(), plan)
+        candidates = [StreamCandidates(str(index), 2.0, (candidate,)) for index in range(2)]
+        engine.prepare(requests(), candidates, [DeviceBudget(10), DeviceBudget(2)])
+        assert all(runner.layout.rank_map == (1,) for _, runner in engine.runners.values())
         results = engine.run()
         if rank == 0:
             assert len(results) == 2
@@ -290,7 +311,7 @@ def distributed_worker(rank, rendezvous):
                 reference = FakeDiT(FakeConfig())
                 from tests.reference import run
                 condition = {"text": torch.tensor([sum(map(ord, request.prompt))], dtype=torch.float32)}
-                expected = run(reference, Sampler.grid(), condition, request.shape, request.chunks, seed=request.seed)
+                expected = run(reference, config.make_sampler(), condition, request.shape, request.chunks, seed=request.seed)
                 torch.testing.assert_close(result["latents"], expected, rtol=0, atol=0)
             assert all(not dit.loaded for dit in config.loaded)
         else:

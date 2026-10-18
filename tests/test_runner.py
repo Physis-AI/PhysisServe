@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 
 from tests import reference
-from physisserve.engine.model_runner import ModelRunner, _execution_plan, _request_schedules, _request_ticks
+from physisserve.engine.model_runner import ModelRunner, _execution_plan
 from physisserve.engine.sampler import Sampler
 from physisserve.engine.strategies import StageEqual, VirtualRank
 from physisserve.engine.strategies.placement import MappedLayout
@@ -113,12 +113,13 @@ def test_interleaved_streams_match_independent_runs(layout):
 def test_tick_counts_include_clean_sink_bootstrap(chunks):
     layout = VirtualRank(2)
     runner = ModelRunner(TinyDiT(), SAMPLER, layout)
-    schedules = _request_schedules(layout, 3, chunks)
+    head = layout.schedule(3, 1)
     ticks = list(runner.run_ticks(None, SHAPE, chunks))
-    assert len(ticks) == _request_ticks(schedules, 3)
+    expected = head.ticks + (4 + layout.schedule(3, chunks - 1).ticks if chunks > 1 else 0)
+    assert len(ticks) == expected
     assert all(not torch.is_inference(latent) for tick in ticks for _, latent in tick)
     if chunks > 1:
-        assert ticks[schedules[0].ticks:schedules[0].ticks + 4] == [[]] * 4
+        assert ticks[head.ticks:head.ticks + 4] == [[]] * 4
 
 
 def test_request_lock_and_failed_request_cleanup():
@@ -144,9 +145,9 @@ def test_rank_local_plans_preserve_transfer_order_and_credit_edges():
     layout = VirtualRank(3)
     schedule = layout.schedule(3, 25)
     spec = (SHAPE, torch.float32)
-    global_batches, global_moves = _execution_plan(schedule, lambda rank: True, 0, spec, spec)
+    global_batches, global_moves = _execution_plan(schedule, lambda rank: True, spec, spec)
     for rank in range(3):
-        batches, moves = _execution_plan(schedule, lambda other: other == rank, 0, spec, spec)
+        batches, moves = _execution_plan(schedule, lambda other: other == rank, spec, spec)
         for tick in range(schedule.ticks):
             assert batches[tick] == tuple(batch for batch in global_batches[tick] if batch[0].rank == rank)
             assert moves[tick] == [move for move in global_moves[tick] if rank in move[1:3]]

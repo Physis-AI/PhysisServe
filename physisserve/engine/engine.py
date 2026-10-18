@@ -6,8 +6,8 @@ from tempfile import mkdtemp
 import torch
 import torch.distributed as dist
 
-from .model_runner import ModelRunner, _request_schedules, _request_ticks
-from .strategies.placement import MappedLayout
+from .model_runner import ModelRunner
+from .strategies.placement import MappedLayout, plan_pool
 from .transport import Distributed, Local
 
 
@@ -55,34 +55,31 @@ class Engine:
                 torch.cuda.synchronize(self.device)
             dist.barrier(group=self.control_group)
 
-    def prepare(self, requests, placement=None):
+    def prepare(self, requests, candidates=None, budgets=()):
         """Encode prompts and load independent stream weights before inference.
 
-        A placement uses stringified input indices as stream IDs. Omitted placement
-        gives every stream the configured layout over the whole GPU pool. Matching
-        runner slots retain their weights across repeated calls.
+        Measured candidates use stringified input indices and budgets in GPU-rank
+        order. Without a resource profile, every stream uses the configured layout
+        over the whole pool. Matching runner slots retain weights across calls.
         """
         self._check_idle()
         self.prepared = False
         self.requests, self.sessions = tuple(requests), ()
-        if placement is None:
+        if candidates is None:
             layout = self.config.make_layout()
             layouts = dict.fromkeys(range(len(self.requests)), layout)
             self.rejected = {}
         else:
+            placement = plan_pool(candidates, budgets)
             placements = tuple(placement.placements)
             layouts = {int(item.stream_id): MappedLayout(
                 item.candidate.layout, item.rank_map, self.config.ranks) for item in placements}
             self.rejected = {int(index): reason for index, reason in placement.rejected.items()}
-        plans = {}
-        for index, layout in layouts.items():
-            schedules = _request_schedules(layout, self.blocks, self.requests[index].chunks)
-            plans[index] = (_request_ticks(schedules, self.blocks),
-                            tuple(tuple(layout.rank_blocks(rank, self.blocks))
-                                  for rank in range(self.config.ranks)))
+        plans = {index: tuple(tuple(layout.rank_blocks(rank, self.blocks))
+                              for rank in range(self.config.ranks)) for index, layout in layouts.items()}
         # Release unused stream weights before loading a replacement or its encoder.
         self.runners = {index: item for index, item in self.runners.items()
-                        if index in plans and item[0] == plans[index][1]}
+                        if index in plans and item[0] == plans[index]}
         conditions = {}
         if layouts and self.is_output:
             encoder = self.config.make_backend(self.config.model).encoder
@@ -98,16 +95,16 @@ class Engine:
             conditions = payload[0]
         sessions = []
         for index in sorted(layouts):
-            layout, (ticks, ownership) = layouts[index], plans[index]
+            layout, ownership = layouts[index], plans[index]
             if index not in self.runners:
                 backend = self.config.make_backend(self.config.model)
                 transport = Distributed(self.device) if self.distributed else Local()
                 runner = ModelRunner(backend.dit, self.sampler, layout, device=self.device,
-                                     dtype=self.dtype, transport=transport, output_rank=0)
+                                     dtype=self.dtype, transport=transport)
                 self.runners[index] = ownership, runner
             runner = self.runners[index][1]
             runner.layout = layout
-            sessions.append((index, ticks, runner, conditions[index]))
+            sessions.append((index, runner, conditions[index]))
         self.sessions = tuple(sessions)
         self._barrier()
         self.prepared = True
@@ -130,7 +127,7 @@ class Engine:
         decoders, videos = {}, {}
         completed = False
         try:
-            for index, ticks, runner, condition in self.sessions:
+            for index, runner, condition in self.sessions:
                 request = self.requests[index]
                 if self.is_output and request.mode == "online_decode":
                     decoder = self.config.make_backend(self.config.model).decoder
@@ -145,14 +142,15 @@ class Engine:
                                             seed=request.seed, fps=request.fps,
                                             on_latent=latent_cb, on_batch=batch_cb)
                 iterators.append(iterator)
-                active.append([index, ticks, iterator])
+                active.append((index, iterator))
             while active:
                 for session in tuple(active):
-                    index, remaining, iterator = session
+                    index, iterator = session
                     try:
                         outputs = next(iterator)
-                    except StopIteration as error:
-                        raise RuntimeError("runner ended before its scheduled final tick") from error
+                    except StopIteration:
+                        active.remove(session)
+                        continue
                     for chunk, latent in outputs:
                         request = self.requests[index]
                         shape = (*request.shape[:2], self.first_frames if chunk == 0 else 1, *request.shape[3:])
@@ -169,14 +167,6 @@ class Engine:
                         if request.mode != "dit_only":
                             latent = latent.cpu()
                         chunks[index].append((chunk, latent))
-                    session[1] -= 1
-                    if remaining == 1:
-                        try:
-                            next(iterator)
-                        except StopIteration:
-                            active.remove(session)
-                        else:
-                            raise RuntimeError("runner produced more ticks than its schedule")
             self._barrier()
             completed = True
             if not self.is_output:
@@ -219,9 +209,7 @@ class Engine:
         if not self.is_output or outputs is None:
             return None
         outputs = list(outputs)
-        if any(output.get("status") != "rejected" and "latents" not in output for output in outputs):
-            raise ValueError("each output must contain latents or an explicit rejection")
-        if not any("latents" in output for output in outputs):
+        if all(output.get("status") == "rejected" for output in outputs):
             return outputs
         if self.device.type == "cuda":
             torch.cuda.empty_cache()

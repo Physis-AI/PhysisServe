@@ -23,33 +23,21 @@ def load_selected_weights(source, names) -> dict[str, torch.Tensor]:
     from safetensors import safe_open
 
     source = Path(source)
-    if not source.is_dir():
-        raise ValueError(f"transformer checkpoint must be a safetensors directory: {source}")
     indexes = sorted(source.glob("*.safetensors.index.json"))
     if len(indexes) > 1:
         raise ValueError(f"multiple safetensors indexes found in {source}: {[path.name for path in indexes]}")
     if indexes:
-        try:
-            mapping = json.loads(indexes[0].read_text())["weight_map"]
-        except (KeyError, TypeError, json.JSONDecodeError) as error:
-            raise ValueError(f"invalid safetensors index {indexes[0]}") from error
-        if not isinstance(mapping, dict):
-            raise ValueError(f"invalid safetensors index {indexes[0]}: weight_map must be an object")
+        mapping = json.loads(indexes[0].read_text())["weight_map"]
         files = {}
         for name in names:
             if name in mapping:
                 filename = mapping[name]
-                if not isinstance(filename, str) or not filename:
-                    raise ValueError(f"invalid shard path for tensor {name!r} in {indexes[0]}")
                 relative = Path(filename)
                 if relative.is_absolute() or ".." in relative.parts:
                     raise ValueError(f"shard path must be relative to {source}: {filename!r}")
                 files.setdefault(source / relative, []).append(name)
     else:
-        shards = sorted(source.glob("*.safetensors"))
-        if not shards:
-            raise ValueError(f"no safetensors weights found in {source}")
-        files = {path: names for path in shards}
+        files = {path: names for path in sorted(source.glob("*.safetensors"))}
 
     state = {}
     for path, wanted in files.items():

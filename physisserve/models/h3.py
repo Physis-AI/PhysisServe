@@ -63,8 +63,6 @@ def phase_aligned_frames(read_frames, query_frames, window_start, sink_frames):
     """
     if read_frames >= window_start:
         return tuple(range(read_frames + query_frames))
-    if not 0 <= sink_frames <= read_frames:
-        raise ValueError(f"a detached read set must start with the {sink_frames}-frame sink, got {read_frames}")
     first = window_start - (read_frames - sink_frames)
     shift = 5 * ((first - sink_frames) // 5)
     return tuple(range(sink_frames)) + tuple(frame - shift for frame in range(first, window_start + query_frames))
@@ -102,8 +100,6 @@ class _Attention:
     def __call__(self, attn, hidden_states, rotary_emb=None, attention_mask=None):
         if attention_mask is not None:
             raise ValueError("H3 AR attention builds its prefix/window mask internally")
-        if self.cache is None or self.key_rotary is None or rotary_emb is None:
-            raise RuntimeError("H3 attention processor was called outside H3DiT.block")
         from diffusers.models.transformers.transformer_minimax_h3 import _apply_rotary_emb
 
         original_shape = hidden_states.shape
@@ -203,12 +199,7 @@ class H3DiT:
         self._batch_conditioning_cache = self._batch_rotary_cache = None
         del fps
         shape = tuple(shape)
-        cfg, b = self.config, shape[0]
-        text = condition.get("text")
-        if text is None or text.ndim != 3 or text.shape[0] != b or text.shape[2] != cfg["text_dim"]:
-            raise ValueError("condition['text'] must be [B, L, text_dim]")
-        if text.shape[1] < 1:
-            raise ValueError("H3 requires at least one text token")
+        text = condition["text"]
         self.shape = shape
         self.chunks = chunks
         self.text = text.to(self.device)
@@ -262,8 +253,6 @@ class H3DiT:
         return self.embeddings[key]
 
     def _rotary(self, chunk, pages):
-        if not 0 <= pages <= chunk:
-            raise ValueError("H3 cache has more history pages than preceding chunks")
         _, _, t, h, w = self.shape
         frames = phase_aligned_frames(pages * t, t, chunk * t, sink_frames=t)
         key = frames
@@ -379,7 +368,7 @@ class H3Encoder:
 
     @torch.inference_mode()
     def encode(self, prompt):
-        if not isinstance(prompt, str) or not prompt:
+        if not prompt:
             raise ValueError("H3 requires a nonempty prompt")
         from diffusers.modular_pipelines.minimax_h3.encoders import get_qwen3vl_prompt_embeds
 
@@ -453,10 +442,6 @@ class H3LatentDecoder:
 
     def decode_sequence(self, latents):
         """Decode ``[B,C,T,H,W]`` concatenated latents to pixels in ``[-1,1]``."""
-        if self.vae is None:
-            raise RuntimeError("load() must be called before decode_sequence()")
-        if latents.ndim != 5:
-            raise ValueError("H3 whole-sequence latents must have shape [B,C,T,H,W]")
         if latents.shape[2] < 3:
             raise ValueError("H3 whole-sequence decode requires at least 3 latent frames")
         z = latents.to(device=self.device, dtype=torch.float32) * self.std + self.mean

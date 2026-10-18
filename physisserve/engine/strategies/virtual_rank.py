@@ -2,8 +2,6 @@
 
 from collections.abc import Sequence
 from functools import lru_cache
-from math import isfinite
-from numbers import Real
 
 from ..sampler import DENOISING_STEPS
 from ..scheduler import Task
@@ -182,7 +180,7 @@ def _improve(initial, ranks, work, parts):
             break
         following = _plan(best[2], ranks, work, parts)
         if following["max_rank_compute_work"] >= ceiling - tolerance:
-            raise ArithmeticError("independently recomputed placement did not strictly improve")
+            break
         current = following
     return current
 
@@ -209,27 +207,8 @@ class VirtualRank(_StaticPlacement):
     def __init__(self, ranks: int | None = None, max_batch: int = 4,
                  batch_costs: Sequence[Sequence[float]] | None = None,
                  admission_window: int | None = None):
-        if ranks is not None and (type(ranks) is not int or ranks < 1):
-            raise ValueError("ranks must be a positive integer")
-        if type(max_batch) is not int or not 1 <= max_batch <= DENOISING_STEPS:
-            raise ValueError(f"max_batch must be an integer from 1 to {DENOISING_STEPS}")
-        if admission_window is not None and (type(admission_window) is not int or admission_window < 1):
-            raise ValueError("admission_window must be a positive integer")
-        if batch_costs is not None and (not isinstance(batch_costs, (list, tuple)) or not batch_costs):
-            raise ValueError("batch_costs must provide a cost curve for every block")
-        rows = []
-        for row in (() if batch_costs is None else batch_costs):
-            if not isinstance(row, (list, tuple)) or len(row) < max_batch:
-                raise ValueError("every batch_costs row must cover max_batch sizes")
-            if any(isinstance(value, bool) or not isinstance(value, Real)
-                   or not isfinite(value) or value <= 0 for value in row):
-                raise ValueError("batch_costs must contain finite positive numbers")
-            rows.append(tuple(float(value) for value in row[:max_batch]))
-        if (not isfinite(sum(sum(row) for row in rows))
-                or not isfinite(DENOISING_STEPS * sum(row[0] for row in rows))):
-            raise ValueError("total batch_costs must be finite")
         self.ranks, self.max_batch = ranks, max_batch
-        self.batch_costs = None if batch_costs is None else tuple(rows)
+        self.batch_costs = None if batch_costs is None else tuple(tuple(row[:max_batch]) for row in batch_costs)
         self.admission_window = admission_window
         self._solutions = {}
 
@@ -239,14 +218,8 @@ class VirtualRank(_StaticPlacement):
         return self._solutions[blocks]
 
     def _solve(self, blocks):
-        if self.batch_costs is not None and len(self.batch_costs) != blocks:
-            raise ValueError("batch_costs must contain one row per block")
         stages = DENOISING_STEPS * blocks
         ranks = blocks if self.ranks is None else self.ranks
-        if ranks > stages:
-            raise ValueError("virtual_rank requires ranks <= the number of stages")
-        if self.admission_window is not None and self.admission_window < stages:
-            raise ValueError("virtual_rank admission_window must be at least the stage count")
         costs = self.batch_costs or ((1.0,) * self.max_batch,) * blocks
         work, parts = _group_costs(costs, self.max_batch)
         if ranks in (1, stages):

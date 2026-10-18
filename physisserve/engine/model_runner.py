@@ -28,21 +28,7 @@ def generator(device, seed: int, chunk: int, step: int) -> torch.Generator:
     return torch.Generator(device=device).manual_seed(seed * 1_000_003 + chunk * 4096 + step + 1)
 
 
-def _request_schedules(layout, blocks: int, chunks: int):
-    """The fixed clean-sink request: chunk 0 first, then the remaining chunks."""
-    schedules = [layout.schedule(blocks, 1)]
-    if chunks > 1:
-        schedules.append(layout.schedule(blocks, chunks - 1))
-    return tuple(schedules)
-
-
-def _request_ticks(schedules, blocks: int) -> int:
-    """Logical ticks for the head, clean-sink forward/redistribution and tail."""
-    transition = blocks + 1 if len(schedules) > 1 else 0
-    return sum(schedule.ticks for schedule in schedules) + transition
-
-
-def _execution_plan(schedule, is_local, output_rank, latent_spec, hidden_spec):
+def _execution_plan(schedule, is_local, latent_spec, hidden_spec):
     """Compile rank-local work once, preserving the global order of matching P2Ps.
 
     The DAG and ownership do not change. Nonparticipant ranks need not rebuild or
@@ -59,8 +45,8 @@ def _execution_plan(schedule, is_local, output_rank, latent_spec, hidden_spec):
                 spec = [latent_spec] if following.block == 0 else [latent_spec, hidden_spec]
                 moves[tick].append((following, task.rank, following.rank, spec, task))
             if task.step == DENOISING_STEPS - 1 and task.block == schedule.blocks - 1:
-                if is_local(task.rank) or is_local(output_rank):
-                    moves[tick].append((task.chunk, task.rank, output_rank, [latent_spec], task))
+                if is_local(task.rank) or is_local(0):
+                    moves[tick].append((task.chunk, task.rank, 0, [latent_spec], task))
                 future = task.chunk + admission_window if admission_window is not None else None
                 if future is not None and future < schedule.chunks:
                     destination = schedule.task(future, 0, 0).rank
@@ -75,29 +61,23 @@ class ModelRunner:
 
     In a single process every logical rank of the layout is simulated. Under torch.distributed the
     layout's ranks are processes 0..ranks-1 of the group and each loads only its own blocks. Finished
-    latents go to ``output_rank``.
+    latents go to rank zero.
     """
 
     def __init__(self, dit, sampler, layout, device="cpu", dtype=torch.float32,
-                 transport=None, output_rank: int = 0):
+                 transport=None):
         """A clean sink runs one extra model-native forward of chunk 0's final latent and pins its pages."""
         self.dit, self.sampler, self.layout = dit, sampler, layout
         self.first_frames, self.sink_sigma = dit.first_frames, dit.sink_sigma
         self.device, self.dtype = torch.device(device), dtype
-        ranks = layout.num_ranks(dit.num_blocks)
         if transport is None:
             transport = Distributed(self.device) if dist.is_initialized() else Local()
-        self.transport, self.output_rank = transport, output_rank
-        if isinstance(transport, Local):
-            blocks = range(dit.num_blocks)
-        else:
-            if transport.rank >= ranks:
-                raise ValueError(f"rank {transport.rank} is not a DiT rank; the layout uses ranks 0..{ranks - 1}")
-            if transport.world < ranks or not 0 <= output_rank < transport.world:
-                raise ValueError(f"the layout needs {ranks} DiT processes plus output rank {output_rank}; "
-                                 f"the group has {transport.world}")
-            blocks = layout.rank_blocks(transport.rank, dit.num_blocks)
+        self.transport = transport
+        blocks = (range(dit.num_blocks) if isinstance(transport, Local)
+                  else layout.rank_blocks(transport.rank, dit.num_blocks))
         dit.load(blocks, self.device, dtype)
+        self.hidden_dtype = getattr(dit, "hidden_dtype", None) or dtype
+        self.page_dtype = getattr(dit, "page_dtype", None) or dtype
         self.busy = False
 
     def run(self, condition, shape, chunks: int, *, seed: int = 0, noise=None,
@@ -141,7 +121,9 @@ class ModelRunner:
         self.busy = True
         try:
             geometry = Chunks(shape, chunks, self.first_frames)
-            schedules = _request_schedules(self.layout, self.dit.num_blocks, chunks)
+            schedules = [self.layout.schedule(self.dit.num_blocks, 1)]
+            if chunks > 1:
+                schedules.append(self.layout.schedule(self.dit.num_blocks, chunks - 1))
             yield from self._run_sink_first(
                 condition, geometry, schedules, seed, noise, fps, on_latent, on_batch)
         finally:
@@ -154,10 +136,10 @@ class ModelRunner:
         device, dtype, shape = self.device, self.dtype, tuple(shape)
         times = [torch.tensor(t, dtype=torch.float32) for t in self.sampler.timesteps]  # CPU scalars
         self.dit.prepare_timesteps(times)
-        latent_spec, hidden_spec = (shape, dtype), (self.dit.hidden_shape(shape), self._hidden_dtype())
+        latent_spec, hidden_spec = (shape, dtype), (self.dit.hidden_shape(shape), self.hidden_dtype)
         last_block = self.dit.num_blocks - 1
         planned_batches, planned_moves = _execution_plan(
-            schedule, local, self.output_rank, latent_spec, hidden_spec)
+            schedule, local, latent_spec, hidden_spec)
         admission_window = getattr(schedule, "admission_window", None)
         # Immutable payload; P2P posting on the compute stream orders a credit
         # after the completed chunk's kernels, even though its value is reused.
@@ -208,12 +190,10 @@ class ModelRunner:
                         else:
                             hidden_outputs = self.dit.block_batch(batch[0].block, hidden_inputs, time_inputs,
                                 [task.chunk + offset for task, _ in members], [cache for _, cache in members])
-                            if len(hidden_outputs) != len(members):
-                                raise RuntimeError("block_batch must return one hidden state per member")
                         if on_batch is not None:
                             on_batch(batch[0].rank, len(members))
                         for (task, cache), sample, hidden, timestep in zip(
-                                members, samples, hidden_outputs, time_inputs):
+                                members, samples, hidden_outputs, time_inputs, strict=True):
                             kv.publish(task, cache)
                             if task.block == last_block:
                                 prediction = self.dit.unembed(hidden, timestep, task.chunk + offset)
@@ -235,8 +215,6 @@ class ModelRunner:
             # yield once so the outer multi-stream scheduler can advance one tick.
             yield [(chunk + offset, pending.wait()[0].clone()) for chunk, pending in outputs]
         self.transport.flush()
-        if states:
-            raise AssertionError("states are still held at the end of the request")
 
     def _run_sink_first(self, condition, geometry, schedules, seed, noise, fps, on_latent, on_batch):
         """Chunk 0 to completion first, then (clean sink) its sink forward, then every later chunk.
@@ -282,7 +260,7 @@ class ModelRunner:
         readers = {}
         for task in rest.tasks:
             readers.setdefault((task.step, task.block), task.rank)
-        page_spec = [(self.dit.kv_shape(first_shape), getattr(self.dit, "page_dtype", None) or self.dtype)] * 2
+        page_spec = [(self.dit.kv_shape(first_shape), self.page_dtype)] * 2
         items = []
         for stage in sorted(readers):
             _, block = stage
@@ -316,19 +294,13 @@ class ModelRunner:
                 kv.pages.clear()
                 sink.clear()
 
-    def _hidden_dtype(self):
-        """dtype of the hidden states between blocks (a backend computing under autocast declares its own)."""
-        return getattr(self.dit, "hidden_dtype", None) or self.dtype
-
     def _sink_forward(self, final, homes, shape, seed, transfer, on_batch):
         """The clean sink pages: one forward of chunk 0's final latent through every block, block ``b`` on
         ``homes[b]``, without history. Each block is one explicit empty-output tick."""
         local, device, dtype = self.transport.is_local, self.device, self.dtype
         timestep = torch.tensor(self.dit.timestep_for_sigma(self.sink_sigma), dtype=torch.float32)
-        latent_spec, hidden_spec = [(shape, dtype)], [(self.dit.hidden_shape(shape), self._hidden_dtype())]
+        latent_spec, hidden_spec = [(shape, dtype)], [(self.dit.hidden_shape(shape), self.hidden_dtype)]
         holder = homes[-1]  # where chunk 0's last pass ended (the rank of its last block)
-        if local(holder) and 0 not in final:
-            raise RuntimeError("chunk 0's final latent is missing on the rank that finished it")
         received = transfer([("sink-latent", holder, homes[0], latent_spec,
                               (final[0],) if local(holder) else None)]) if local(holder) or local(homes[0]) else {}
         pages, hidden, pending = {}, None, None

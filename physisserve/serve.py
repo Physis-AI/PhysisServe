@@ -12,7 +12,6 @@ import torch.multiprocessing as mp
 
 from .config import Config
 from .engine.engine import Engine
-from .engine.strategies.placement import PoolPlan
 from .sampling_params import SamplingParams
 
 
@@ -144,27 +143,22 @@ class PhysisServe:
             raise ValueError("provide one SamplingParams or one per prompt")
         return [param.request(prompt, self.config) for prompt, param in zip(prompts, params)]
 
-    def generate(self, prompts, sampling_params=None, *, placement=None):
+    def generate(self, prompts, sampling_params=None):
         """Return ordered CPU latents and, for decoding modes, uint8 THWC videos.
 
-        Every prompt has its own KV cache and seed. ``placement`` optionally accepts
-        a measured resource plan from ``physisserve.engine.strategies.placement``.
+        Every prompt has its own KV cache and seed.
         ``SamplingParams.mode`` selects DiT only, decoding after all streams finish,
         or decoding completed chunks during denoising. Offline decoding first
         saves each stream's latents to disk; ``latent_path`` identifies the file.
         """
         requests = self._requests(prompts, sampling_params)
-        if placement is not None:
-            if type(placement) is not PoolPlan:
-                raise TypeError("placement must be a PoolPlan")
-            placement.validate(self.config.ranks, self.config.num_blocks, len(requests))
         if not requests:
             return []
         if not self.config.supports_online_decode and any(r.mode == "online_decode" for r in requests):
             raise ValueError(f"{self.config.backend} uses a whole-sequence VAE; online_decode is unsupported")
         if any(r.mode != "dit_only" and r.chunks < self.config.min_decode_chunks for r in requests):
             raise ValueError(f"{self.config.backend} video decoding requires at least {self.config.min_decode_chunks} chunks")
-        self._call("prepare", requests, placement=placement)
+        self._call("prepare", requests)
         outputs = self._call("run")[0]
         offline = [index for index, request in enumerate(requests)
                    if request.mode == "offline_decode" and outputs[index].get("status") != "rejected"]

@@ -19,15 +19,11 @@ class StageEqual(_StaticPlacement):
     """
 
     def __init__(self, ranks: int | None = None):
-        if ranks is not None and (type(ranks) is not int or ranks < 1):
-            raise ValueError("ranks must be a positive integer")
         self.ranks = ranks
 
     def _stage_owners(self, blocks: int) -> tuple[int, ...]:
         stages = DENOISING_STEPS * blocks
         ranks = stages if self.ranks is None else self.ranks
-        if ranks > stages:
-            raise ValueError("stage-equal placement requires ranks <= four times blocks")
         quotient, remainder = divmod(stages, ranks)
         return tuple(rank for rank in range(ranks) for _ in range(quotient + (rank < remainder)))
 

@@ -6,7 +6,7 @@ import torch
 from physisserve.engine.kv_cache import Cache
 from physisserve.models.base import load_selected_weights
 from physisserve.models.h3 import H3DiT, phase_aligned_frames
-from physisserve.models.ltx2 import LTX2DiT
+from physisserve.models.ltx2 import LTX2Decoder, LTX2DiT
 from physisserve.models.wan import WanDecoder, WanDiT
 
 
@@ -29,13 +29,60 @@ def test_selective_shards_load_only_owned_tensors(tmp_path):
 
     save_file({"owned": torch.tensor([3]), "other": torch.tensor([7])}, tmp_path / "part.safetensors")
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
-        "weight_map": {"owned": "part.safetensors", "other": "part.safetensors"},
+        "weight_map": {"owned": "part.safetensors", "other": "unopened.safetensors"},
     }))
     state = load_selected_weights(tmp_path, ("owned",))
     assert set(state) == {"owned"}
     assert state["owned"].item() == 3
     with pytest.raises(ValueError, match="missing tensors"):
         load_selected_weights(tmp_path, ("missing",))
+
+
+@pytest.mark.parametrize("filename", ["../outside.safetensors", "/outside.safetensors"])
+def test_selected_shard_paths_must_be_relative(tmp_path, filename):
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"owned": filename}}))
+    with pytest.raises(ValueError, match="shard path must be relative"):
+        load_selected_weights(tmp_path, ("owned",))
+
+
+def test_unindexed_shards_reject_missing_or_duplicate_selected_tensors(tmp_path):
+    from safetensors.torch import save_file
+
+    save_file({"owned": torch.tensor([3])}, tmp_path / "part-1.safetensors")
+    save_file({"other": torch.tensor([7])}, tmp_path / "part-2.safetensors")
+    state = load_selected_weights(tmp_path, ("owned",))
+    assert set(state) == {"owned"}
+    assert state["owned"].item() == 3
+    with pytest.raises(ValueError, match="missing tensors"):
+        load_selected_weights(tmp_path, ("missing",))
+    save_file({"owned": torch.tensor([4])}, tmp_path / "part-3.safetensors")
+    with pytest.raises(ValueError, match="duplicate tensor"):
+        load_selected_weights(tmp_path, ("owned",))
+
+
+def test_indexed_shard_cannot_leave_selected_tensor_unloaded(tmp_path):
+    from safetensors.torch import save_file
+
+    save_file({"other": torch.tensor([7])}, tmp_path / "part.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {"owned": "part.safetensors"},
+    }))
+    with pytest.raises(ValueError, match="missing tensors"):
+        load_selected_weights(tmp_path, ("owned",))
+
+
+def test_ltx_decoder_rejects_broadcastable_latent_channels():
+    from types import SimpleNamespace
+
+    decoder = LTX2Decoder.__new__(LTX2Decoder)
+    decoder.mean = torch.zeros(1, 128, 1, 1, 1)
+    decoder.std = torch.ones_like(decoder.mean)
+    decoder.device, decoder.dtype = torch.device("cpu"), torch.float32
+    decoder.vae = SimpleNamespace(
+        config=SimpleNamespace(scaling_factor=1, timestep_conditioning=False),
+        decode=lambda *args, **kwargs: pytest.fail("invalid channels must not reach the VAE"))
+    with pytest.raises(ValueError, match="channels"):
+        decoder.decode_sequence(torch.zeros(1, 1, 3, 2, 2))
 
 
 def tiny_transformer(family):

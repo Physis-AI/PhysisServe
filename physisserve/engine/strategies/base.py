@@ -1,8 +1,7 @@
-"""Shared plan validation and static-placement helpers for single-stream strategies."""
+"""Batch schedule storage and static-placement helpers for single-stream strategies."""
 
 from collections.abc import Sequence
 
-from ..sampler import DENOISING_STEPS
 from ..scheduler import Schedule, Task
 
 
@@ -27,38 +26,7 @@ class BatchSchedule(Schedule):
         self.ticks = len(self.by_tick_batches)
         self.by_tick = [[task for batch in tick for task in batch] for tick in self.by_tick_batches]
         self.tasks = sorted(task for tick in self.by_tick for task in tick)
-        self.task_of = {}
-        for tick, batches in enumerate(self.by_tick_batches):
-            for batch in batches:
-                if not 1 <= len(batch) <= DENOISING_STEPS:
-                    raise ValueError("a batch must have between one and four cells")
-                if len({(task.rank, task.block) for task in batch}) != 1:
-                    raise ValueError("all batch members must share a rank and block")
-                for task in batch:
-                    if any(type(value) is not int for value in
-                           (task.tick, task.rank, task.chunk, task.step, task.block)):
-                        raise ValueError("task coordinates must be integers")
-                    if (task.tick != tick or task.rank < 0 or not 0 <= task.chunk < chunks
-                            or not 0 <= task.step < DENOISING_STEPS or not 0 <= task.block < blocks):
-                        raise ValueError("task coordinates are outside the schedule")
-                    if task.key in self.task_of:
-                        raise ValueError(f"duplicate scheduled cell: {task.key}")
-                    self.task_of[task.key] = task
-        if len(self.tasks) != chunks * DENOISING_STEPS * blocks:
-            raise ValueError("schedule must cover every (chunk, step, block) exactly once")
-        for task in self.tasks:
-            stage = task.step * blocks + task.block
-            predecessors = []
-            if stage:
-                step, block = divmod(stage - 1, blocks)
-                predecessors.append(self.task(task.chunk, step, block))
-            if task.chunk:
-                predecessors.append(self.task(task.chunk - 1, task.step, task.block))
-            if (admission_window is not None and stage == 0
-                    and task.chunk >= admission_window):
-                predecessors.append(self.output(task.chunk - admission_window))
-            if any(previous.tick >= task.tick for previous in predecessors):
-                raise ValueError(f"cell {task.key} requires all predecessors in prior ticks")
+        self.task_of = {task.key: task for task in self.tasks}
 
 
 class _StaticPlacement:

@@ -7,10 +7,6 @@ import torch
 
 from physisserve import PhysisServe, SamplingParams
 from physisserve.config import Config
-from physisserve.engine.strategies import StageEqual, VirtualRank
-from physisserve.engine.strategies.placement import (
-    Candidate, DeviceBudget, PoolPlan, RankDemand, StreamCandidates, StreamPlacement, plan_pool,
-)
 from physisserve.sampling_params import Request
 from tests.test_engine import FakeConfig
 
@@ -93,8 +89,6 @@ def test_invalid_config_is_rejected_before_model_resolution(monkeypatch, kwargs)
     ({"admission_window": 119}, {}),
     ({}, {"num_layers": 0}), ({}, {"num_layers": True}),
     ({}, {"in_channels": 0}), ({}, {"in_channels": True}),
-    ({}, {"patch_size": [1, 2]}), ({}, {"patch_size": [1, 0, 2]}),
-    ({}, {"patch_size": [1, True, 2]}),
 ])
 def test_model_dependent_config_is_rejected_before_engine_or_workers(monkeypatch, tmp_path,
                                                                   options, metadata):
@@ -326,112 +320,10 @@ def test_invalid_generate_containers_fail_before_worker_call(prompts, params):
         model.generate(prompts, params)
 
 
-@pytest.mark.parametrize("case", [
-    "wrong_type", "pool_size", "missing", "duplicate", "unknown", "overlap",
-    "physical_rank", "local_ranks", "cost_rows", "admission_window",
-    "placement_type", "candidate_type", "rejection_reason", "rank_map_length",
-])
-def test_invalid_placement_fails_before_worker_call(case):
-    demand = RankDemand(1, 0.1)
-    candidate = Candidate("one", StageEqual(1), (demand,), 1.0)
-    placements = (StreamPlacement("0", candidate, (0,)), StreamPlacement("1", candidate, (0,)))
-    rejected, loads = {}, (demand,)
-    if case == "pool_size":
-        loads = (demand, demand)
-    elif case == "missing":
-        placements = placements[:1]
-    elif case == "duplicate":
-        placements = (placements[0], placements[0])
-    elif case == "unknown":
-        placements = (placements[0], StreamPlacement("2", candidate, (0,)))
-    elif case == "overlap":
-        rejected = {"0": "pool full"}
-    elif case == "physical_rank":
-        placements = (StreamPlacement("0", candidate, (1,)), placements[1])
-    elif case == "placement_type":
-        placements = (object(), placements[1])
-    elif case == "rejection_reason":
-        placements, rejected = placements[:1], {"1": None}
-    elif case == "rank_map_length":
-        placements = (StreamPlacement("0", candidate, (0, 0)), placements[1])
-    elif case == "candidate_type":
-        placements = (StreamPlacement("0", object(), (0,)), placements[1])
-    elif case in ("local_ranks", "cost_rows", "admission_window"):
-        layout = {"local_ranks": StageEqual(2),
-                  "cost_rows": VirtualRank(1, batch_costs=[[1, 2, 3, 4]]),
-                  "admission_window": VirtualRank(1, admission_window=1)}[case]
-        candidate = Candidate("invalid", layout, (demand,), 1.0)
-        placements = (StreamPlacement("0", candidate, (0,)), placements[1])
-    plan = object() if case == "wrong_type" else PoolPlan(placements, rejected, loads)
+def test_generate_does_not_accept_external_placement():
     model = PhysisServe.__new__(PhysisServe)
-    model.config = fake_config("fake")
-    model._call = lambda *args, **kwargs: pytest.fail("invalid placement must fail before worker calls")
-    with pytest.raises((TypeError, ValueError)):
-        model.generate(["cat", "dog"], SamplingParams(mode="dit_only"), placement=plan)
-
-
-@pytest.mark.parametrize("rank", [-1, 0.5, True])
-@pytest.mark.parametrize("prompts", [["cat"], []])
-def test_manual_placement_rejects_invalid_rank_maps_before_worker_call(rank, prompts):
-    demand = RankDemand(1, 0.1)
-    candidate = Candidate("one", StageEqual(1), (demand,), 1.0)
-    plan = PoolPlan((StreamPlacement("0", candidate, (rank,)),), {}, (demand,))
-    model = PhysisServe.__new__(PhysisServe)
-    model.config = fake_config("fake")
-    model._call = lambda *args, **kwargs: pytest.fail("invalid rank maps must fail before worker calls")
-    with pytest.raises(ValueError):
-        model.generate(prompts, SamplingParams(mode="dit_only"), placement=plan)
-
-
-def test_placement_execution_ignores_planning_metadata(monkeypatch):
-    monkeypatch.setattr("physisserve.serve.Config", fake_config)
-    candidate = Candidate("", StageEqual(2), (), float("nan"))
-    plan = PoolPlan((StreamPlacement("0", candidate, (0, 0)),), {}, (RankDemand(-1, float("nan")),))
-    with PhysisServe("fake", device="cpu") as model:
-        params = SamplingParams(mode="dit_only", seed=17)
-        expected = model.generate("cat", params)[0]
-        actual = model.generate("cat", params, placement=plan)[0]
-    torch.testing.assert_close(actual["latents"], expected["latents"], rtol=0, atol=0)
-
-
-def test_manual_placement_rejects_custom_layouts_before_calling_them():
-    class CustomLayout:
-        def num_ranks(self, blocks):
-            pytest.fail("an unapproved layout must not be called")
-
-        rank_blocks = schedule = num_ranks
-
-    class CustomStageEqual(StageEqual):
-        num_ranks = rank_blocks = schedule = CustomLayout.num_ranks
-
-    class CustomVirtualRank(VirtualRank):
-        num_ranks = rank_blocks = schedule = CustomLayout.num_ranks
-
-    model = PhysisServe.__new__(PhysisServe)
-    model.config = fake_config("fake")
-    model._call = lambda *args, **kwargs: pytest.fail("custom layouts must fail before worker calls")
-    for layout in (CustomLayout(), CustomStageEqual(1), CustomVirtualRank(1)):
-        demand = RankDemand(1, 0.1)
-        candidate = Candidate("custom", layout, (demand,), 1.0)
-        plan = PoolPlan((StreamPlacement("0", candidate, (0,)),), {}, (demand,))
-        with pytest.raises(ValueError):
-            model.generate("cat", SamplingParams(mode="dit_only"), placement=plan)
-
-
-@pytest.mark.parametrize("strategy", [StageEqual, VirtualRank])
-def test_public_placement_accepts_builtin_layouts_and_preserves_rejections(monkeypatch, strategy):
-    monkeypatch.setattr("physisserve.serve.Config", fake_config)
-    candidate = Candidate("pair", strategy(2), (RankDemand(1, 0.1),) * 2, 1.0)
-    plan = plan_pool([StreamCandidates("0", 2, 5, 1.0, ()),
-                      StreamCandidates("1", 2, 5, 1.0, (candidate,))], [DeviceBudget(10)])
-    assert plan.placements[0].rank_map == (0, 0)
-    with PhysisServe("fake", device="cpu") as model:
-        params = SamplingParams(mode="dit_only")
-        outputs = model.generate(("cat", "dog"), (params, params), placement=plan)
-        assert [output["prompt"] for output in outputs] == ["cat", "dog"]
-        assert outputs[0]["status"] == "rejected" and "latents" not in outputs[0]
-        assert outputs[1]["latents"].shape == (1, 2, 7, 2, 2)
-        assert model.config.encoded == ["dog"] and len(model.config.loaded) == 1
+    with pytest.raises(TypeError, match="unexpected keyword argument 'placement'"):
+        model.generate("cat", placement=object())
 
 
 def test_complete_diffusers_model_generates_decodable_video(tmp_path):

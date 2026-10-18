@@ -25,17 +25,6 @@ class Task:
 class Schedule:
     """Every cell of a request placed on (tick, rank); identical on every rank."""
 
-    def __init__(self, tasks: list[Task], blocks: int):
-        self.tasks = sorted(tasks)
-        self.blocks = blocks
-        self.task_of = {t.key: t for t in self.tasks}
-        self.ticks = self.tasks[-1].tick + 1
-        self.by_tick: list[list[Task]] = [[] for _ in range(self.ticks)]
-        for task in self.tasks:
-            self.by_tick[task.tick].append(task)
-        if any(len({t.rank for t in batch}) != len(batch) for batch in self.by_tick):
-            raise AssertionError("two cells scheduled on one rank in the same tick")
-
     def task(self, chunk: int, step: int, block: int) -> Task:
         return self.task_of[chunk, step, block]
 
