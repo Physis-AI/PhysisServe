@@ -85,6 +85,30 @@ def fake_config(model, *, ranks=1, strategy="virtual_rank", **kwargs):
     return config
 
 
+def test_example_direct_api_writes_videos(monkeypatch, tmp_path):
+    import example
+    import imageio.v3 as iio
+
+    monkeypatch.setattr("physisserve.serve.Config", fake_config)
+    services = []
+
+    def make_service(model, **kwargs):
+        service = PhysisServe(model, device="cpu", **kwargs)
+        services.append(service)
+        return service
+
+    monkeypatch.setattr(example, "PhysisServe", make_service)
+    try:
+        example.main()
+        assert len(services) == 1 and not services[0]._closed
+        for index in range(2):
+            assert iio.imread(tmp_path / f"video-{index}.mp4").shape == (13, 2, 2, 3)
+        assert len(list((tmp_path / "latents").glob("generate-*/*.safetensors"))) == 2
+    finally:
+        for service in services:
+            service.close()
+
+
 @pytest.mark.parametrize("ranks", [1, 2])
 def test_public_generate_unifies_single_multiple_and_deferred_video(monkeypatch, ranks):
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
