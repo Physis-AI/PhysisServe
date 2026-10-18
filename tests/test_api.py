@@ -7,6 +7,10 @@ import torch
 
 from physisserve import PhysisServe, SamplingParams
 from physisserve.config import Config
+from physisserve.engine.strategies import StageEqual, VirtualRank
+from physisserve.engine.strategies.placement import (
+    Candidate, DeviceBudget, PoolPlan, RankDemand, StreamCandidates, StreamPlacement, plan_pool,
+)
 from physisserve.sampling_params import Request
 from tests.test_engine import FakeConfig
 
@@ -60,6 +64,55 @@ def test_standard_diffusers_profiles(tmp_path, name, channels, blocks, backend, 
     with pytest.raises(ValueError, match="spatial patch"):
         SamplingParams(width=831).request("cat", config)
     assert Config(str(tmp_path), strategy="stage_equal").max_batch == 1
+    assert config.max_batch == 4
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"model": None}, {"model": 123}, {"model": ""}, {"model": "  "},
+    {"ranks": None}, {"ranks": 0}, {"ranks": True}, {"ranks": 1.5},
+    {"strategy": "custom"}, {"strategy": []}, {"max_batch": 0}, {"max_batch": 5},
+    {"max_batch": True}, {"device": "mps"}, {"encoder_device": None},
+    {"admission_window": 0}, {"admission_window": True},
+    {"batch_costs": []}, {"batch_costs": "1234"}, {"batch_costs": [[1, 2]]},
+    {"batch_costs": [[1, True, 2, 3]]}, {"batch_costs": [[float("nan")] * 4]},
+    {"batch_costs": [[1e308] * 4]},
+    {"strategy": "stage_equal", "max_batch": 2},
+    {"strategy": "stage_equal", "batch_costs": [[1]]},
+    {"strategy": "stage_equal", "admission_window": 1},
+])
+def test_invalid_config_is_rejected_before_model_resolution(monkeypatch, kwargs):
+    monkeypatch.setattr("physisserve.config.resolve_model", lambda *args: pytest.fail(
+        "invalid configuration must fail before resolving or downloading the model"))
+    with pytest.raises((TypeError, ValueError)):
+        Config(**{"model": "unresolved-model", **kwargs})
+
+
+@pytest.mark.parametrize("options,metadata", [
+    ({"pipeline_parallel_size": 121}, {}),
+    ({"batch_costs": [[1, 2, 3, 4]]}, {}),
+    ({"admission_window": 119}, {}),
+    ({}, {"num_layers": 0}), ({}, {"num_layers": True}),
+    ({}, {"in_channels": 0}), ({}, {"in_channels": True}),
+    ({}, {"patch_size": [1, 2]}), ({}, {"patch_size": [1, 0, 2]}),
+    ({}, {"patch_size": [1, True, 2]}),
+])
+def test_model_dependent_config_is_rejected_before_engine_or_workers(monkeypatch, tmp_path,
+                                                                  options, metadata):
+    for component in ("transformer", "vae", "text_encoder", "tokenizer"):
+        (tmp_path / component).mkdir()
+    (tmp_path / "model_index.json").write_text("{}")
+    (tmp_path / "transformer" / "config.json").write_text(json.dumps({
+        "_class_name": "WanTransformer3DModel", "in_channels": 16, "num_layers": 30,
+        "patch_size": [1, 2, 2], **metadata,
+    }))
+
+    def fail(*args, **kwargs):
+        pytest.fail("invalid configuration must fail before loading an engine or starting workers")
+
+    monkeypatch.setattr("physisserve.serve.Engine", fail)
+    monkeypatch.setattr("physisserve.serve.mp.get_context", fail)
+    with pytest.raises(ValueError):
+        PhysisServe(tmp_path, device="cpu", **options)
 
 
 @pytest.mark.parametrize("family,dit_class,options,text_length", [
@@ -80,6 +133,7 @@ def test_model_factories_own_component_defaults(monkeypatch, tmp_path, family, d
 def fake_config(model, *, ranks=1, strategy="virtual_rank", **kwargs):
     config = FakeConfig(ranks=ranks, strategy=strategy)
     config.backend, config.channels, config.height, config.width = "wan", 2, 2, 2
+    config.num_blocks = 2
     config.spatial_scale, config.patch_size, config.chunks, config.fps = 1, (1, 1, 1), 5, 16
     config.supports_online_decode, config.min_decode_chunks = True, 1
     return config
@@ -158,6 +212,8 @@ def test_worker_failure_is_reported_and_processes_are_reaped(monkeypatch):
 
 @pytest.mark.parametrize("kwargs", [
     {"num_chunks": 0}, {"height": -1}, {"seed": -1}, {"fps": True},
+    {"num_chunks": True}, {"height": 1.5}, {"width": 0}, {"fps": 0},
+    {"seed": True}, {"seed": 2**31},
     {"mode": "video"}, {"mode": "stream_decode"}, {"mode": "deferred_decode"},
     {"mode": None}, {"mode": []},
     {"latent_dir": ""}, {"latent_dir": "  "}, {"latent_dir": 3},
@@ -255,6 +311,70 @@ def test_invalid_prompt_rejected_before_worker_call(prompt):
     model._call = lambda *args, **kwargs: pytest.fail("invalid input must fail before worker calls")
     with pytest.raises(TypeError, match="prompt.*string"):
         model.generate([prompt])
+
+
+@pytest.mark.parametrize("prompts,params", [
+    (None, None), (123, None), ({"cat": 1}, None), ({"cat"}, None),
+    ("cat", {}), ("cat", {SamplingParams()}), ("cat", "params"),
+    ("cat", [None]), (["cat", "dog"], [SamplingParams()]),
+])
+def test_invalid_generate_containers_fail_before_worker_call(prompts, params):
+    model = PhysisServe.__new__(PhysisServe)
+    model.config = fake_config("fake")
+    model._call = lambda *args, **kwargs: pytest.fail("invalid input must fail before worker calls")
+    with pytest.raises((TypeError, ValueError)):
+        model.generate(prompts, params)
+
+
+@pytest.mark.parametrize("case", [
+    "wrong_type", "pool_size", "missing", "duplicate", "unknown", "overlap",
+    "physical_rank", "local_ranks", "cost_rows", "admission_window",
+])
+def test_invalid_placement_fails_before_worker_call(case):
+    demand = RankDemand(1, 0.1)
+    candidate = Candidate("one", StageEqual(1), (demand,), 1.0)
+    placements = (StreamPlacement("0", candidate, (0,)), StreamPlacement("1", candidate, (0,)))
+    rejected, loads = {}, (demand,)
+    if case == "pool_size":
+        loads = (demand, demand)
+    elif case == "missing":
+        placements = placements[:1]
+    elif case == "duplicate":
+        placements = (placements[0], placements[0])
+    elif case == "unknown":
+        placements = (placements[0], StreamPlacement("2", candidate, (0,)))
+    elif case == "overlap":
+        rejected = {"0": "pool full"}
+    elif case == "physical_rank":
+        placements = (StreamPlacement("0", candidate, (1,)), placements[1])
+    elif case in ("local_ranks", "cost_rows", "admission_window"):
+        layout = {"local_ranks": StageEqual(2),
+                  "cost_rows": VirtualRank(1, batch_costs=[[1, 2, 3, 4]]),
+                  "admission_window": VirtualRank(1, admission_window=1)}[case]
+        candidate = Candidate("invalid", layout, (demand,), 1.0)
+        placements = (StreamPlacement("0", candidate, (0,)), placements[1])
+    plan = object() if case == "wrong_type" else PoolPlan(placements, rejected, loads)
+    model = PhysisServe.__new__(PhysisServe)
+    model.config = fake_config("fake")
+    model._call = lambda *args, **kwargs: pytest.fail("invalid placement must fail before worker calls")
+    with pytest.raises((TypeError, ValueError)):
+        model.generate(["cat", "dog"], SamplingParams(mode="dit_only"), placement=plan)
+
+
+@pytest.mark.parametrize("strategy", [StageEqual, VirtualRank])
+def test_public_placement_accepts_builtin_layouts_and_preserves_rejections(monkeypatch, strategy):
+    monkeypatch.setattr("physisserve.serve.Config", fake_config)
+    candidate = Candidate("pair", strategy(2), (RankDemand(1, 0.1),) * 2, 1.0)
+    plan = plan_pool([StreamCandidates("0", 2, 5, 1.0, ()),
+                      StreamCandidates("1", 2, 5, 1.0, (candidate,))], [DeviceBudget(10)])
+    assert plan.placements[0].rank_map == (0, 0)
+    with PhysisServe("fake", device="cpu") as model:
+        params = SamplingParams(mode="dit_only")
+        outputs = model.generate(("cat", "dog"), (params, params), placement=plan)
+        assert [output["prompt"] for output in outputs] == ["cat", "dog"]
+        assert outputs[0]["status"] == "rejected" and "latents" not in outputs[0]
+        assert outputs[1]["latents"].shape == (1, 2, 7, 2, 2)
+        assert model.config.encoded == ["dog"] and len(model.config.loaded) == 1
 
 
 def test_complete_diffusers_model_generates_decodable_video(tmp_path):

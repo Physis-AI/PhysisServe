@@ -219,10 +219,8 @@ def test_placement_preserves_input_order_and_reports_rejections_without_loading(
     assert engine.run() == [] and not engine.runners
 
 
-def test_bad_placement_and_decoder_shapes_fail_explicitly(monkeypatch):
+def test_unprepared_engine_and_decoder_shapes_fail_explicitly(monkeypatch):
     engine = Engine(FakeConfig())
-    with pytest.raises(ValueError, match="cover every input"):
-        engine.prepare(requests(), PoolPlan((), {}, (RankDemand(0, 0.0),)))
     with pytest.raises(RuntimeError, match="prepare"):
         engine.run()
     engine.prepare(requests())

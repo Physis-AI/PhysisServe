@@ -6,21 +6,6 @@ from ..sampler import DENOISING_STEPS
 from ..scheduler import Schedule, Task
 
 
-def _positive_int(value: int, name: str) -> None:
-    if type(value) is not int or value < 1:
-        raise ValueError(f"{name} must be a positive integer")
-
-
-def _ranks(ranks: int | None) -> None:
-    if ranks is not None:
-        _positive_int(ranks, "ranks")
-
-
-def _batch_limit(max_batch: int) -> None:
-    if type(max_batch) is not int or not 1 <= max_batch <= DENOISING_STEPS:
-        raise ValueError(f"max_batch must be an integer from 1 to {DENOISING_STEPS}")
-
-
 def _equal_parts(length: int, count: int) -> tuple[range, ...]:
     quotient, remainder = divmod(length, count)
     cuts = [0]
@@ -47,10 +32,6 @@ class BatchSchedule(Schedule):
 
     def __init__(self, by_tick_batches: Sequence[Sequence[Sequence[Task]]],
                  blocks: int, chunks: int, admission_window: int | None = None):
-        _positive_int(blocks, "blocks")
-        _positive_int(chunks, "chunks")
-        if admission_window is not None:
-            _positive_int(admission_window, "admission_window")
         self.blocks = blocks
         self.chunks = chunks
         self.admission_window = admission_window
@@ -101,7 +82,4 @@ class _StaticPlacement:
 
     def rank_blocks(self, rank: int, blocks: int) -> tuple[int, ...]:
         owners = self._stage_owners(blocks)
-        ranks = max(owners) + 1
-        if type(rank) is not int or not 0 <= rank < ranks:
-            raise ValueError(f"rank {rank} is outside the {ranks} ranks of this layout")
         return tuple(sorted({stage % blocks for stage, owner in enumerate(owners) if owner == rank}))

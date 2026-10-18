@@ -7,7 +7,7 @@ from numbers import Real
 
 from ..sampler import DENOISING_STEPS
 from ..scheduler import Task
-from .base import BatchSchedule, _StaticPlacement, _batch_limit, _positive_int, _ranks
+from .base import BatchSchedule, _StaticPlacement
 
 
 def _group_costs(costs, limit):
@@ -209,15 +209,17 @@ class VirtualRank(_StaticPlacement):
     def __init__(self, ranks: int | None = None, max_batch: int = 4,
                  batch_costs: Sequence[Sequence[float]] | None = None,
                  admission_window: int | None = None):
-        _ranks(ranks)
-        _batch_limit(max_batch)
-        if admission_window is not None:
-            _positive_int(admission_window, "admission_window")
-        if batch_costs is not None and not len(batch_costs):
+        if ranks is not None and (type(ranks) is not int or ranks < 1):
+            raise ValueError("ranks must be a positive integer")
+        if type(max_batch) is not int or not 1 <= max_batch <= DENOISING_STEPS:
+            raise ValueError(f"max_batch must be an integer from 1 to {DENOISING_STEPS}")
+        if admission_window is not None and (type(admission_window) is not int or admission_window < 1):
+            raise ValueError("admission_window must be a positive integer")
+        if batch_costs is not None and (not isinstance(batch_costs, (list, tuple)) or not batch_costs):
             raise ValueError("batch_costs must provide a cost curve for every block")
         rows = []
         for row in (() if batch_costs is None else batch_costs):
-            if len(row) < max_batch:
+            if not isinstance(row, (list, tuple)) or len(row) < max_batch:
                 raise ValueError("every batch_costs row must cover max_batch sizes")
             if any(isinstance(value, bool) or not isinstance(value, Real)
                    or not isfinite(value) or value <= 0 for value in row):
@@ -232,7 +234,6 @@ class VirtualRank(_StaticPlacement):
         self._solutions = {}
 
     def _solution(self, blocks):
-        _positive_int(blocks, "blocks")
         if blocks not in self._solutions:
             self._solutions[blocks] = self._solve(blocks)
         return self._solutions[blocks]
@@ -268,7 +269,6 @@ class VirtualRank(_StaticPlacement):
         return self._solution(blocks)["stage_owners"]
 
     def schedule(self, blocks: int, chunks: int) -> BatchSchedule:
-        _positive_int(chunks, "chunks")
         result = self._solution(blocks)
         owners, groups = result["stage_owners"], result["rank_groups"]
         stages = DENOISING_STEPS * blocks

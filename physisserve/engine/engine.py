@@ -68,18 +68,12 @@ class Engine:
         self.requests, self.sessions = tuple(requests), ()
         if not self.supports_online_decode and any(r.mode == "online_decode" for r in self.requests):
             raise ValueError("this VAE requires whole-sequence decoding; use offline_decode")
-        ids = {str(index) for index in range(len(self.requests))}
         if placement is None:
             layout = self.config.make_layout()
             layouts = dict.fromkeys(range(len(self.requests)), layout)
             self.rejected = {}
         else:
             placements = tuple(placement.placements)
-            placed_ids = [item.stream_id for item in placements]
-            if (placement.num_ranks != self.config.ranks or len(set(placed_ids)) != len(placed_ids)
-                    or set(placed_ids) & set(placement.rejected)
-                    or set(placed_ids) | set(placement.rejected) != ids):
-                raise ValueError("placement must cover every input index exactly once on the configured pool")
             layouts = {int(item.stream_id): MappedLayout(
                 item.candidate.layout, item.rank_map, self.config.ranks) for item in placements}
             self.rejected = {int(index): reason for index, reason in placement.rejected.items()}

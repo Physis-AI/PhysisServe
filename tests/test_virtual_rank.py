@@ -4,7 +4,7 @@ from collections import Counter
 import pytest
 
 from tests.test_scheduler import assert_dag
-from physisserve.engine.strategies import VirtualRank
+from physisserve.engine.strategies import StageEqual, VirtualRank
 from physisserve.engine.strategies.virtual_rank import _group_costs, _improve, _plan
 
 
@@ -129,30 +129,38 @@ def test_scale_invariance_determinism_and_mutation_isolation():
     assert layout.schedule(5, 23).tasks == before
 
 
-@pytest.mark.parametrize("costs", [[], [[1, 2]], [[0, 1, 2, 3]], [[True, 1, 2, 3]],
+@pytest.mark.parametrize("costs", [[], "1234", iter([[1, 2, 3, 4]]), [None], ["1234"],
+                                   [iter([1, 2, 3, 4])], [[1, 2]], [[0, 1, 2, 3]], [[True, 1, 2, 3]],
                                    [[float("inf")] * 4], [[float("nan")] * 4], [[1e308] * 4]])
 def test_invalid_costs(costs):
     with pytest.raises(ValueError):
         VirtualRank(batch_costs=costs)
 
 
-def test_invalid_dimensions_and_rank_bounds():
+def test_tuple_cost_curves():
+    assert VirtualRank(batch_costs=((1, 2, 3, 4),)).placement(1) == VirtualRank(
+        batch_costs=[[1, 2, 3, 4]]).placement(1)
+
+
+def test_invalid_strategy_options():
     for field in ("ranks", "max_batch", "admission_window"):
         for value in (0, -1, True, 1.5):
             with pytest.raises(ValueError):
                 VirtualRank(batch_costs=[[1, 2, 3, 4]], **{field: value})
+    with pytest.raises(ValueError, match="max_batch"):
+        VirtualRank(max_batch=5)
+    for ranks in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="ranks"):
+            StageEqual(ranks)
+
+
+def test_model_dependent_bounds():
     layout = VirtualRank(batch_costs=[[1, 2, 3, 4]])
-    for value in (0, True, 1.5):
-        with pytest.raises(ValueError):
-            layout.placement(value)
-        with pytest.raises(ValueError):
-            layout.schedule(1, value)
-    for rank in (-1, 100, True, 0.5):
-        with pytest.raises(ValueError):
-            layout.rank_blocks(rank, 1)
     with pytest.raises(ValueError, match="one row"):
         layout.placement(2)
     with pytest.raises(ValueError, match="number of stages"):
         VirtualRank(5, batch_costs=[[1, 2, 3, 4]]).placement(1)
     with pytest.raises(ValueError, match="stage count"):
         VirtualRank(1, batch_costs=[[1, 2, 3, 4]], admission_window=3).placement(1)
+    with pytest.raises(ValueError, match="ranks <= four times blocks"):
+        StageEqual(5).num_ranks(1)

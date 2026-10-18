@@ -14,6 +14,24 @@ def problem(name, *candidates):
     return StreamCandidates(name, 2, 12, 20, candidates)
 
 
+def test_candidate_allows_only_builtin_strategy_types():
+    class CustomLayout:
+        def num_ranks(self, blocks):
+            pytest.fail("an unapproved layout must not be called")
+
+        rank_blocks = schedule = num_ranks
+
+    class CustomStageEqual(StageEqual):
+        pass
+
+    class CustomVirtualRank(VirtualRank):
+        pass
+
+    for layout in (CustomLayout(), CustomStageEqual(1), CustomVirtualRank(1)):
+        with pytest.raises(ValueError):
+            Candidate("custom", layout, (RankDemand(1, 0.1),), 1.0)
+
+
 def test_unknown_or_failing_single_stream_gap_is_not_admitted():
     p = problem("p", candidate("unknown", [(1, 0.1)], None), candidate("slow", [(1, 0.1)], 21))
     plan = plan_pool([p], [DeviceBudget(10)])

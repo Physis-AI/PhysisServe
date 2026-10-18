@@ -3,10 +3,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from math import isfinite
 from numbers import Real
-from typing import Any
 
 from ..scheduler import Task
 from .base import BatchSchedule
+from .stage_equal import StageEqual
+from .virtual_rank import VirtualRank
 
 
 def _integer(value, name, minimum=0):
@@ -43,16 +44,15 @@ class DeviceBudget:
 @dataclass(frozen=True)
 class Candidate:
     name: str
-    layout: Any
+    layout: StageEqual | VirtualRank
     demands: tuple[RankDemand, ...]
     max_gap_ms: float | None = None
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("candidate name must be a nonempty string")
-        if any(not callable(getattr(self.layout, name, None))
-               for name in ("num_ranks", "rank_blocks", "schedule")):
-            raise ValueError("layout must implement the single-stream layout interface")
+        if type(self.layout) not in (StageEqual, VirtualRank):
+            raise ValueError("layout must be StageEqual or VirtualRank")
         object.__setattr__(self, "demands", tuple(self.demands))
         if not self.demands or any(not isinstance(item, RankDemand) for item in self.demands):
             raise ValueError("demands must contain one RankDemand per local rank")
@@ -114,6 +114,26 @@ class PoolPlan:
     @property
     def num_ranks(self):
         return len(self.loads)
+
+    def validate(self, ranks, blocks, streams):
+        if (not isinstance(self.placements, (list, tuple)) or not isinstance(self.rejected, dict)
+                or not isinstance(self.loads, (list, tuple))
+                or any(type(load) is not RankDemand for load in self.loads)
+                or any(not isinstance(reason, str) for reason in self.rejected.values())):
+            raise ValueError("placement requires placements, string rejection reasons and RankDemand loads")
+        if self.num_ranks != ranks:
+            raise ValueError("placement must use the configured GPU pool")
+        if any(type(item) is not StreamPlacement for item in self.placements):
+            raise ValueError("placements must contain StreamPlacement objects")
+        placed = [item.stream_id for item in self.placements]
+        if (len(set(placed)) != len(placed) or set(placed) & set(self.rejected)
+                or set(placed) | set(self.rejected) != {str(index) for index in range(streams)}):
+            raise ValueError("placement must cover every input index exactly once")
+        for item in self.placements:
+            if item.candidate.layout.num_ranks(blocks) != len(item.rank_map):
+                raise ValueError("rank_map must cover exactly the single-stream local ranks")
+            if any(rank >= ranks for rank in item.rank_map):
+                raise ValueError("mapped rank is outside the pool")
 
 
 def _budgets(budgets):
@@ -254,39 +274,19 @@ class MappedLayout:
     latency guarantee is invented. Idle pool ranks return an empty block set.
     """
     def __init__(self, layout, rank_map, total_ranks):
-        _integer(total_ranks, "total_ranks", 1)
         self.rank_map = tuple(rank_map)
-        if not self.rank_map:
-            raise ValueError("rank_map must not be empty")
-        for rank in self.rank_map:
-            _integer(rank, "physical rank")
-            if rank >= total_ranks:
-                raise ValueError("mapped rank is outside the pool")
-        if any(not callable(getattr(layout, name, None))
-               for name in ("num_ranks", "rank_blocks", "schedule")):
-            raise ValueError("layout must implement the single-stream layout interface")
         self.layout, self.total_ranks = layout, total_ranks
         self.max_batch = getattr(layout, "max_batch", 1)
         self.admission_window = getattr(layout, "admission_window", None)
 
-    def _validate(self, blocks):
-        if self.layout.num_ranks(blocks) != len(self.rank_map):
-            raise ValueError("rank_map must cover exactly the single-stream local ranks")
-
     def num_ranks(self, blocks):
-        self._validate(blocks)
         return self.total_ranks
 
     def rank_blocks(self, rank, blocks):
-        self._validate(blocks)
-        _integer(rank, "physical rank")
-        if rank >= self.total_ranks:
-            raise ValueError("rank is outside the pool")
         return tuple(sorted({block for local, physical in enumerate(self.rank_map) if physical == rank
                              for block in self.layout.rank_blocks(local, blocks)}))
 
     def schedule(self, blocks, chunks):
-        self._validate(blocks)
         schedule = self.layout.schedule(blocks, chunks)
         batches = schedule.by_tick_batches
         remapped = [tuple(tuple(Task(task.tick, self.rank_map[task.rank], task.chunk, task.step, task.block)

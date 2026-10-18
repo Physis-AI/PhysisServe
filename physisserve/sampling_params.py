@@ -32,7 +32,7 @@ class SamplingParams:
         if self.latent_dir is not None:
             if not isinstance(self.latent_dir, (str, Path)) or not str(self.latent_dir).strip():
                 raise ValueError("latent_dir must be a nonempty directory path")
-            path = Path(self.latent_dir)
+            path = Path(self.latent_dir).expanduser()
             if path.exists() and not path.is_dir():
                 raise ValueError("latent_dir must be a directory")
             object.__setattr__(self, "latent_dir", path)

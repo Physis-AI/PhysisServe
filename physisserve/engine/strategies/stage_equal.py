@@ -2,7 +2,7 @@
 
 from ..sampler import DENOISING_STEPS
 from ..scheduler import Task
-from .base import BatchSchedule, _StaticPlacement, _equal_parts, _owners, _positive_int, _ranks
+from .base import BatchSchedule, _StaticPlacement, _equal_parts, _owners
 
 
 class StageEqual(_StaticPlacement):
@@ -19,11 +19,11 @@ class StageEqual(_StaticPlacement):
     """
 
     def __init__(self, ranks: int | None = None):
-        _ranks(ranks)
+        if ranks is not None and (type(ranks) is not int or ranks < 1):
+            raise ValueError("ranks must be a positive integer")
         self.ranks = ranks
 
     def _stage_owners(self, blocks: int) -> tuple[int, ...]:
-        _positive_int(blocks, "blocks")
         stages = DENOISING_STEPS * blocks
         ranks = stages if self.ranks is None else self.ranks
         if ranks > stages:
@@ -31,7 +31,6 @@ class StageEqual(_StaticPlacement):
         return _owners(_equal_parts(stages, ranks))
 
     def schedule(self, blocks: int, chunks: int) -> BatchSchedule:
-        _positive_int(chunks, "chunks")
         owners = self._stage_owners(blocks)
         ends = [-1] * (max(owners) + 1)
         previous_chunk = [-1] * len(owners)

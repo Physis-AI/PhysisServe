@@ -12,6 +12,7 @@ import torch.multiprocessing as mp
 
 from .config import Config
 from .engine.engine import Engine
+from .engine.strategies.placement import PoolPlan
 from .sampling_params import SamplingParams
 
 
@@ -52,9 +53,9 @@ class PhysisServe:
     """
 
     def __init__(self, model, *, pipeline_parallel_size=1, strategy="virtual_rank",
-                 max_batch_size=4, device="cuda", encoder_device="cpu",
+                 max_batch_size=None, device="cuda", encoder_device="cpu",
                  batch_costs=None, admission_window=None):
-        self.config = Config(str(model), ranks=pipeline_parallel_size, strategy=strategy,
+        self.config = Config(model, ranks=pipeline_parallel_size, strategy=strategy,
                              max_batch=max_batch_size, device=device, encoder_device=encoder_device,
                              batch_costs=batch_costs, admission_window=admission_window)
         self._engine = None
@@ -116,9 +117,13 @@ class PhysisServe:
             raise
 
     def _requests(self, prompts, sampling_params):
+        if not isinstance(prompts, (str, list, tuple)):
+            raise TypeError("prompts must be a string or a list/tuple of strings")
         prompts = [prompts] if isinstance(prompts, str) else list(prompts)
         if sampling_params is None:
             sampling_params = SamplingParams()
+        if not isinstance(sampling_params, (SamplingParams, list, tuple)):
+            raise TypeError("sampling_params must be SamplingParams or a list/tuple of SamplingParams")
         params = ([sampling_params] * len(prompts) if isinstance(sampling_params, SamplingParams)
                   else list(sampling_params))
         if len(params) != len(prompts) or any(not isinstance(item, SamplingParams) for item in params):
@@ -135,6 +140,10 @@ class PhysisServe:
         saves each stream's latents to disk; ``latent_path`` identifies the file.
         """
         requests = self._requests(prompts, sampling_params)
+        if placement is not None:
+            if type(placement) is not PoolPlan:
+                raise TypeError("placement must be a PoolPlan")
+            placement.validate(self.config.ranks, self.config.num_blocks, len(requests))
         if not requests:
             return []
         if not self.config.supports_online_decode and any(r.mode == "online_decode" for r in requests):
