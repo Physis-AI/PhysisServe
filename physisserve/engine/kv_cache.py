@@ -36,10 +36,6 @@ class Cache:
         self.page: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def __call__(self, key: torch.Tensor, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.page is not None:
-            raise RuntimeError("a block forward may write its KV only once")
-        if key.ndim != 4 or key.shape != value.shape:
-            raise ValueError("KV pages must be [B, heads, tokens, head_dim] with matching shapes")
         self.page = (key, value)
         if not self.history:
             return key, value
@@ -105,14 +101,8 @@ class KVCache:
                       for key in keys])
 
     def publish(self, task: Task, cache: Cache):
-        if cache.page is None:
-            raise RuntimeError(f"block {task.block} did not write its K/V into the cache")
         self.pages[task.key] = cache.page
 
     def release(self, tick: int):
         for key in self.expiry[tick]:
             del self.pages[key]
-
-    def close(self):
-        if self.pages:
-            raise AssertionError("KV pages are still held at the end of the request")

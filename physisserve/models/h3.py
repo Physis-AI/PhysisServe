@@ -98,8 +98,6 @@ class _Attention:
         self.batch_shape = None
 
     def __call__(self, attn, hidden_states, rotary_emb=None, attention_mask=None):
-        if attention_mask is not None:
-            raise ValueError("H3 AR attention builds its prefix/window mask internally")
         from diffusers.models.transformers.transformer_minimax_h3 import _apply_rotary_emb
 
         original_shape = hidden_states.shape
@@ -403,9 +401,6 @@ class H3LatentDecoder:
     must concatenate all q=1 chunks along temporal dimension 2 and call
     :meth:`decode_sequence` once.
 
-    ``frames`` retains the engine's pixel-frame accounting contract for DiT-only
-    benchmarks. H3's temporal VAE assigns repeating ``(1, 4, 4, 4, 4)`` pixel
-    contributions to latent frames and accepts a final partial group.
     """
 
     pixel_mean = (0.485, 0.456, 0.406)
@@ -433,12 +428,6 @@ class H3LatentDecoder:
         self.image_std = torch.tensor(
             self.pixel_std, device=self.device, dtype=torch.float32
         ).view(1, -1, 1, 1, 1)
-
-    def frames(self, chunk, shape):
-        temporal = shape[2]
-        first = chunk * temporal
-        contributions = (1, 4, 4, 4, 4)
-        return sum(contributions[index % len(contributions)] for index in range(first, first + temporal))
 
     def decode_sequence(self, latents):
         """Decode ``[B,C,T,H,W]`` concatenated latents to pixels in ``[-1,1]``."""

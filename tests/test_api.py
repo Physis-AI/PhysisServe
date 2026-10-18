@@ -110,7 +110,7 @@ def test_model_dependent_config_is_rejected_before_engine_or_workers(monkeypatch
 
 
 @pytest.mark.parametrize("family,dit_class,options,text_length", [
-    ("wan", "WanDiT", {"cache_text_kv": True}, 512),
+    ("wan", "WanDiT", {}, 512),
     ("ltx2", "LTX2DiT", {"compute_dtype": torch.bfloat16}, 1024),
     ("h3", "H3DiT", {}, None),
 ])

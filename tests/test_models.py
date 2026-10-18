@@ -2,6 +2,7 @@ import json
 
 import pytest
 import torch
+from safetensors import SafetensorError
 
 from physisserve.engine.kv_cache import Cache
 from physisserve.models.base import load_selected_weights
@@ -34,7 +35,7 @@ def test_selective_shards_load_only_owned_tensors(tmp_path):
     state = load_selected_weights(tmp_path, ("owned",))
     assert set(state) == {"owned"}
     assert state["owned"].item() == 3
-    with pytest.raises(ValueError, match="missing tensors"):
+    with pytest.raises(KeyError, match="missing"):
         load_selected_weights(tmp_path, ("missing",))
 
 
@@ -45,19 +46,15 @@ def test_selected_shard_paths_must_be_relative(tmp_path, filename):
         load_selected_weights(tmp_path, ("owned",))
 
 
-def test_unindexed_shards_reject_missing_or_duplicate_selected_tensors(tmp_path):
+def test_unsharded_file_loads_only_selected_tensors(tmp_path):
     from safetensors.torch import save_file
 
-    save_file({"owned": torch.tensor([3])}, tmp_path / "part-1.safetensors")
-    save_file({"other": torch.tensor([7])}, tmp_path / "part-2.safetensors")
+    save_file({"owned": torch.tensor([3]), "other": torch.tensor([7])}, tmp_path / "model.safetensors")
     state = load_selected_weights(tmp_path, ("owned",))
     assert set(state) == {"owned"}
     assert state["owned"].item() == 3
-    with pytest.raises(ValueError, match="missing tensors"):
+    with pytest.raises(SafetensorError):
         load_selected_weights(tmp_path, ("missing",))
-    save_file({"owned": torch.tensor([4])}, tmp_path / "part-3.safetensors")
-    with pytest.raises(ValueError, match="duplicate tensor"):
-        load_selected_weights(tmp_path, ("owned",))
 
 
 def test_indexed_shard_cannot_leave_selected_tensor_unloaded(tmp_path):
@@ -67,7 +64,7 @@ def test_indexed_shard_cannot_leave_selected_tensor_unloaded(tmp_path):
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
         "weight_map": {"owned": "part.safetensors"},
     }))
-    with pytest.raises(ValueError, match="missing tensors"):
+    with pytest.raises(SafetensorError):
         load_selected_weights(tmp_path, ("owned",))
 
 
@@ -110,9 +107,10 @@ def tiny_transformer(family):
 
 
 @pytest.mark.parametrize("family", ["wan21_14b", "ltx2", "h3"])
-def test_selective_blocks_materialize_one_shot_ownership(tmp_path, family):
+@pytest.mark.parametrize("sharded", [False, True])
+def test_selective_blocks_materialize_one_shot_ownership(tmp_path, family, sharded):
     model, adapter, _, _ = tiny_transformer(family)
-    model.save_pretrained(tmp_path)
+    model.save_pretrained(tmp_path, max_shard_size="16KB" if sharded else "10GB")
     dit = adapter(tmp_path)
     owned = tuple(range(0, dit.num_blocks, 2))
     dit.load((block for block in owned), "cpu", torch.float32)

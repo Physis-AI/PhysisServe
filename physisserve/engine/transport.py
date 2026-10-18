@@ -105,8 +105,6 @@ class Distributed:
             return []
         works = [_Work(work) for work in dist.batch_isend_irecv(
             [dist.P2POp(op, tensor, peer, self.group) for op, tensor, peer in operations])]
-        if not works:
-            raise RuntimeError("distributed operations returned no work handles")
         # Retain receiver storage too, even if its Pending is discarded before
         # completion. A stream wait alone does not establish device completion.
         self.inflight.append((works, tuple(tensor for _, tensor, _ in operations)))

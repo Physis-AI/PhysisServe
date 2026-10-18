@@ -78,7 +78,6 @@ class ModelRunner:
         dit.load(blocks, self.device, dtype)
         self.hidden_dtype = getattr(dit, "hidden_dtype", None) or dtype
         self.page_dtype = getattr(dit, "page_dtype", None) or dtype
-        self.busy = False
 
     def run(self, condition, shape, chunks: int, *, seed: int = 0, noise=None,
             fps: float | None = None, on_latent=None, on_batch=None) -> Iterator[tuple[int, torch.Tensor]]:
@@ -116,18 +115,12 @@ class ModelRunner:
         abort the whole service/process group rather than resume unmatched peer traffic.
         Callback semantics and input requirements are identical to :meth:`run`.
         """
-        if self.busy:
-            raise RuntimeError("a ModelRunner serves one request at a time; exhaust the previous run first")
-        self.busy = True
-        try:
-            geometry = Chunks(shape, chunks, self.first_frames)
-            schedules = [self.layout.schedule(self.dit.num_blocks, 1)]
-            if chunks > 1:
-                schedules.append(self.layout.schedule(self.dit.num_blocks, chunks - 1))
-            yield from self._run_sink_first(
-                condition, geometry, schedules, seed, noise, fps, on_latent, on_batch)
-        finally:
-            self.busy = False
+        geometry = Chunks(shape, chunks, self.first_frames)
+        schedules = [self.layout.schedule(self.dit.num_blocks, 1)]
+        if chunks > 1:
+            schedules.append(self.layout.schedule(self.dit.num_blocks, chunks - 1))
+        yield from self._run_sink_first(
+            condition, geometry, schedules, seed, noise, fps, on_latent, on_batch)
 
     def _execute_ticks(self, shape, seed, noise, on_latent, on_batch, schedule, kv, states, transfer, *, offset=0):
         """``offset``: the schedule's chunk ``i`` is the request's chunk ``i + offset`` (noise, positions, outputs);
@@ -240,18 +233,11 @@ class ModelRunner:
                 on_latent(chunk, latent)
 
         kv, states = KVCache(head, local), {}
-        completed = False
         try:
             yield from self._execute_ticks(first_shape, seed, noise, keep_final, on_batch, head, kv, states, transfer)
-            completed = True
         finally:
-            if not completed:
-                kv.pages.clear()
-            try:
-                kv.close()
-            finally:
-                kv.pages.clear()
-                states.clear()
+            kv.pages.clear()
+            states.clear()
         if rest is None:
             return
         sink = {}
@@ -267,9 +253,6 @@ class ModelRunner:
             src, page = homes[block], pages.get(block)
             if not (local(src) or local(readers[stage])):
                 continue
-            if src != readers[stage] and local(src) and any(
-                    tensor.dtype != spec[1] for tensor, spec in zip(page, page_spec)):
-                raise RuntimeError(f"a sink page of stage {stage} is not {page_spec[0][1]}")
             items.append((("sink", *stage), src, readers[stage], page_spec, page if local(src) else None))
         for (_, step, block), pending in transfer(items).items():
             sink[0, step, block] = tuple(pending.wait())
@@ -277,22 +260,15 @@ class ModelRunner:
         # Make the page redistribution visible to multi-stream tick interleaving.
         yield []
         kv, states = KVCache(rest, local, offset=1, sink=sink), {}
-        completed = False
         try:
             execution = self._execute_ticks(shape, seed, noise, on_latent, on_batch,
                                             rest, kv, states, transfer, offset=1)
             del rest
             yield from execution
-            completed = True
         finally:
-            if not completed:
-                kv.pages.clear()
-            try:
-                kv.close()
-            finally:
-                states.clear()
-                kv.pages.clear()
-                sink.clear()
+            states.clear()
+            kv.pages.clear()
+            sink.clear()
 
     def _sink_forward(self, final, homes, shape, seed, transfer, on_batch):
         """The clean sink pages: one forward of chunk 0's final latent through every block, block ``b`` on

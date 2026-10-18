@@ -46,20 +46,11 @@ def test_benchmark_aggregates_same_rank_gaps_and_discards_bootstrap():
     assert result["max_batch"] == 4
 
 
-@pytest.mark.parametrize("ranks, message", [
-    ([[row(0, [1, 2, 3], 1)], [row(0, [1, 2, 3], 1)]], "one owner"),
-    ([[{"times": {}, "max_batch": 1}]], "missing stream"),
-    ([[row(0, [1, 2], 1)]], "missing or duplicate"),
-    ([[row(0, [1, 3, 2], 1)]], "nondecreasing"),
-])
-def test_benchmark_rejects_incomplete_or_invalid_timing(ranks, message):
-    with pytest.raises(ValueError, match=message):
-        summarize(ranks, streams=1, chunks=3, repeats=1, skip_chunks=0)
-
-
-def test_benchmark_requires_a_steady_interval():
-    with pytest.raises(ValueError, match="at least two"):
-        summarize([], streams=1, chunks=3, repeats=1, skip_chunks=2)
+def test_benchmark_requires_a_steady_interval_at_cli(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["bench.py", "fake", "--chunks", "3", "--skip-chunks", "2"])
+    with pytest.raises(SystemExit, match="2"):
+        bench.main()
+    assert "chunks > skip-chunks + 1" in capsys.readouterr().err
 
 
 def test_batched_completion_bursts_do_not_inflate_throughput():

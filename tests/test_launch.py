@@ -146,6 +146,8 @@ with Path("script-ran").open("x") as marker:
     marker.write(str(os.getpid()))
 config_calls = []
 def make_config(model, **kwargs):
+    # Give every worker an ordinary local model path; fake weights stay in the fixture.
+    Path(model).mkdir(parents=True, exist_ok=True)
     config_calls.append(kwargs["ranks"])
     config = fake_config(model, **kwargs)
     config.launch_test_token = "created in user script only"

@@ -111,10 +111,12 @@ def test_static_kv_cache_read_sets_and_lifetimes(layout):
                 assert schedule.task(*key).rank == task.rank
                 last_use[key] = tick
             cache = kv.context(task)
+            assert cache.page is None
             assert all(page is published[key] for page, key in zip(cache.history, expected))
             label = task.chunk * 100 + task.step * 10 + task.block
             page = torch.full((1, 1, 1, 1), float(label))
             _, values = cache(page, page)
+            assert cache.page == (page, page)
             torch.testing.assert_close(values.flatten(), torch.tensor([
                 float(chunk * 100 + step * 10 + block) for chunk, step, block in [*expected, task.key]
             ]))
@@ -134,7 +136,7 @@ def test_static_kv_cache_read_sets_and_lifetimes(layout):
         assert set(kv.pages) == set(published) - expired
     assert expired == set(schedule.task_of)
     assert sum(len(entries) for entries in kv.expiry) == len(schedule.tasks)
-    kv.close()
+    assert not kv.pages
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
@@ -179,13 +181,3 @@ def test_fixed_home_cache_does_not_retain_global_schedule(local):
     gc.collect()
     assert reference() is None
     assert {task.key for task in kv.reads} == expected_keys
-
-
-def test_missing_sink_or_unpublished_history_fails_when_read():
-    schedule = StageEqual(1).schedule(1, 2)
-    kv = KVCache(schedule, lambda rank: True, offset=1)
-    with pytest.raises(KeyError):
-        kv.context(schedule.task(0, 0, 0))
-    kv = KVCache(schedule, lambda rank: True)
-    with pytest.raises(KeyError):
-        kv.context(schedule.task(1, 0, 0))

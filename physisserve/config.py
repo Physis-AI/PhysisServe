@@ -90,8 +90,8 @@ class Config:
             return StageEqual(self.ranks)
         return VirtualRank(self.ranks, self.max_batch, self.batch_costs, self.admission_window)
 
-    def make_backend(self, root=None):
-        return importlib.import_module(f"physisserve.models.{self.backend}").backend(root or self.model)
+    def make_backend(self):
+        return importlib.import_module(f"physisserve.models.{self.backend}").backend(self.model)
 
     def make_sampler(self):
         from .engine.sampler import Sampler

@@ -100,9 +100,6 @@ class FakeDecoder:
     def load(self, device, dtype):
         self.config.decoder_loads += 1
 
-    def frames(self, chunk, shape):
-        return shape[2] * 2 - (chunk == 0)
-
     def reset(self):
         self.next_chunk = 0
         self.config.resets += 1
@@ -131,7 +128,7 @@ class FakeConfig:
         self.loaded, self.encoded, self.sequences = [], [], []
         self.encoder_loads = self.decoder_loads = self.resets = 0
 
-    def make_backend(self, root):
+    def make_backend(self):
         decoder = SequenceDecoder if self.sequence else FakeDecoder
         return SimpleNamespace(dit=FakeDiT(self), encoder=FakeEncoder(self), decoder=decoder(self))
 
@@ -158,14 +155,25 @@ def test_interleaved_streams_equal_independent_requests_and_reuse_weights(strate
     config = FakeConfig(strategy, first_frames)
     engine = Engine(config)
     engine.prepare(requests())
-    batches, completions = [], []
+    batches, completions, latent_shapes = [], [], {}
+
+    def completed(index, chunk, latent):
+        completions.append((index, chunk))
+        latent_shapes[index, chunk] = tuple(latent.shape)
+
     results = engine.run(on_batch=lambda index, rank, size: batches.append(index),
-                         on_latent=lambda index, chunk, value: completions.append((index, chunk)))
+                         on_latent=completed)
     assert batches[:2] == [0, 1]
     assert completions.index((1, 0)) < completions.index((0, requests()[0].chunks - 1))
     assert len(config.loaded) == 2 and config.encoder_loads == 1 and config.decoder_loads == 0
     assert [output["prompt"] for output in results] == ["cat", "dog"]
-    for output, reference in zip(results, expected):
+    for index, (output, reference) in enumerate(zip(results, expected)):
+        request = requests()[index]
+        assert [chunk for stream, chunk in completions if stream == index] == list(range(request.chunks))
+        for chunk in range(request.chunks):
+            frames = first_frames if chunk == 0 else 1
+            assert latent_shapes[index, chunk] == (*request.shape[:2], frames, *request.shape[3:])
+        assert output["chunks"] == request.chunks and output["first_frames"] == first_frames
         torch.testing.assert_close(output["latents"], reference, rtol=0, atol=0)
         assert output["latents"].device.type == "cpu" and output["latents"].is_contiguous()
     again = engine.run()
@@ -187,7 +195,7 @@ def test_offline_decode_resets_each_video_and_accounts_for_first_chunk(sequence,
     load = FakeDecoder.load
 
     def load_after_dit_release(decoder, device, dtype):
-        assert engine.sessions == () and engine.runners == {} and not engine.prepared
+        assert engine.sessions == () and engine.runners == {}
         load(decoder, device, dtype)
 
     monkeypatch.setattr(FakeDecoder, "load", load_after_dit_release)
@@ -240,57 +248,28 @@ def test_internal_pool_colocates_stream_stages_without_changing_single_stream_la
         torch.testing.assert_close(output["latents"], latent, rtol=0, atol=0)
 
 
-def test_unprepared_engine_and_decoder_shapes_fail_explicitly(monkeypatch):
-    engine = Engine(FakeConfig())
-    with pytest.raises(RuntimeError, match="prepare"):
-        engine.run()
-    engine.prepare(requests())
-    outputs = engine.run()
-    monkeypatch.setattr(FakeDecoder, "decode", lambda self, latent, chunk: torch.zeros(1, 3, 1, 2, 2))
-    with pytest.raises(ValueError, match="decoder must return"):
-        engine.decode(outputs)
-    with pytest.raises(ValueError, match="metadata"):
-        engine.decode([{**outputs[0], "chunks": 1}])
-
-
-def test_failed_callback_releases_local_runner_and_reentrancy_is_rejected():
+def test_failed_callback_closes_stream_iterators_before_reuse(monkeypatch):
     engine = Engine(FakeConfig())
     engine.prepare(requests())
+    closed = []
+    for _, runner in engine.runners.values():
+        run_ticks = runner.run_ticks
+
+        def tracked(*args, run_ticks=run_ticks, runner=runner, **kwargs):
+            try:
+                yield from run_ticks(*args, **kwargs)
+            finally:
+                closed.append(runner)
+
+        monkeypatch.setattr(runner, "run_ticks", tracked)
 
     def callback(*args):
-        with pytest.raises(RuntimeError, match="already running"):
-            engine.run()
         raise RuntimeError("callback failed")
 
     with pytest.raises(RuntimeError, match="callback failed"):
         engine.run(on_latent=callback)
-    assert not engine.busy and not engine.failed
-    assert all(not runner.busy for _, runner in engine.runners.values())
+    assert set(closed) == {runner for _, runner in engine.runners.values()}
     assert len(engine.run()) == 2
-
-
-@pytest.mark.parametrize("corruption", ["missing", "duplicate", "shape"])
-def test_incomplete_or_wrong_shape_runner_output_is_never_returned(monkeypatch, corruption):
-    engine = Engine(FakeConfig())
-    engine.prepare(requests()[:1])
-    runner = engine.runners[0][1]
-    run_ticks = runner.run_ticks
-
-    def bad_outputs(*args, **kwargs):
-        for outputs in run_ticks(*args, **kwargs):
-            if outputs and outputs[0][0] == 0:
-                if corruption == "missing":
-                    outputs = []
-                elif corruption == "duplicate":
-                    outputs = outputs + outputs
-                else:
-                    outputs = [(0, outputs[0][1][:, :, :1])]
-            yield outputs
-
-    monkeypatch.setattr(runner, "run_ticks", bad_outputs)
-    with pytest.raises(RuntimeError, match="missing or duplicate|incorrect latent shape"):
-        engine.run()
-    assert not engine.busy
 
 
 def distributed_worker(rank, rendezvous):

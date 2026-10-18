@@ -16,40 +16,31 @@ import torch
 def load_selected_weights(source, names) -> dict[str, torch.Tensor]:
     """Load only ``names`` from a Diffusers safetensors directory.
 
-    The directory may contain either one safetensors index or ordinary shards.
-    Multiple indexes are ambiguous and rejected explicitly.
+    Read the indexed shards or the single unsharded safetensors file.
     """
     names = tuple(names)
     from safetensors import safe_open
 
     source = Path(source)
-    indexes = sorted(source.glob("*.safetensors.index.json"))
-    if len(indexes) > 1:
-        raise ValueError(f"multiple safetensors indexes found in {source}: {[path.name for path in indexes]}")
+    indexes = list(source.glob("*.safetensors.index.json"))
     if indexes:
-        mapping = json.loads(indexes[0].read_text())["weight_map"]
+        index, = indexes
+        mapping = json.loads(index.read_text())["weight_map"]
         files = {}
         for name in names:
-            if name in mapping:
-                filename = mapping[name]
-                relative = Path(filename)
-                if relative.is_absolute() or ".." in relative.parts:
-                    raise ValueError(f"shard path must be relative to {source}: {filename!r}")
-                files.setdefault(source / relative, []).append(name)
+            relative = Path(mapping[name])
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"shard path must be relative to {source}: {str(relative)!r}")
+            files.setdefault(source / relative, []).append(name)
     else:
-        files = {path: names for path in sorted(source.glob("*.safetensors"))}
+        path, = source.glob("*.safetensors")
+        files = {path: names}
 
     state = {}
     for path, wanted in files.items():
         with safe_open(path, framework="pt", device="cpu") as file:
-            available = set(file.keys())
             for name in wanted:
-                if name in available:
-                    if name in state:
-                        raise ValueError(f"duplicate tensor {name!r} across safetensors shards")
-                    state[name] = file.get_tensor(name)
-    if missing := set(names) - state.keys():
-        raise ValueError(f"checkpoint is missing tensors: {sorted(missing)[:5]}")
+                state[name] = file.get_tensor(name)
     return state
 
 

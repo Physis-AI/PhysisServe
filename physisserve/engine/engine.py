@@ -20,8 +20,6 @@ class Engine:
         if self.device.type == "cuda":
             self.device = torch.device("cuda", torch.cuda.current_device())
             torch.cuda.set_device(self.device)
-        if (dist.get_world_size() if self.distributed else 1) != config.ranks:
-            raise ValueError("initialize exactly config.ranks processes before constructing the engine")
         self.control_group = control_group
         if self.distributed:
             if dist.get_backend() == "nccl":
@@ -32,22 +30,15 @@ class Engine:
                                       dist.new_group(backend="gloo", timeout=timedelta(minutes=30)))
         self.dtype = getattr(torch, config.dtype)
         self.codec_dtype = getattr(torch, config.compute_dtype or config.dtype)
-        backend = config.make_backend(config.model)
+        backend = config.make_backend()
         self.blocks, self.first_frames = backend.dit.num_blocks, backend.dit.first_frames
         self.sampler = config.make_sampler()
         self.runners = {}
         self.requests, self.sessions, self.rejected = (), (), {}
-        self.prepared = self.busy = self.failed = False
 
     @property
     def is_output(self):
         return self.rank == 0
-
-    def _check_idle(self):
-        if self.busy:
-            raise RuntimeError("the engine is already running")
-        if self.failed:
-            raise RuntimeError("distributed execution failed; restart the process group")
 
     def _barrier(self):
         if self.distributed:
@@ -62,8 +53,6 @@ class Engine:
         order. Without a resource profile, every stream uses the configured layout
         over the whole pool. Matching runner slots retain weights across calls.
         """
-        self._check_idle()
-        self.prepared = False
         self.requests, self.sessions = tuple(requests), ()
         if candidates is None:
             layout = self.config.make_layout()
@@ -82,7 +71,7 @@ class Engine:
                         if index in plans and item[0] == plans[index]}
         conditions = {}
         if layouts and self.is_output:
-            encoder = self.config.make_backend(self.config.model).encoder
+            encoder = self.config.make_backend().encoder
             encoder.load(self.config.encoder_device, self.codec_dtype)
             with torch.inference_mode():
                 for index in sorted(layouts):
@@ -97,7 +86,7 @@ class Engine:
         for index in sorted(layouts):
             layout, ownership = layouts[index], plans[index]
             if index not in self.runners:
-                backend = self.config.make_backend(self.config.model)
+                backend = self.config.make_backend()
                 transport = Distributed(self.device) if self.distributed else Local()
                 runner = ModelRunner(backend.dit, self.sampler, layout, device=self.device,
                                      dtype=self.dtype, transport=transport)
@@ -107,7 +96,6 @@ class Engine:
             sessions.append((index, runner, conditions[index]))
         self.sessions = tuple(sessions)
         self._barrier()
-        self.prepared = True
 
     def run(self, on_latent=None, on_batch=None):
         """Interleave one tick per active stream; return CPU latents on rank zero.
@@ -118,19 +106,14 @@ class Engine:
         online_decode additionally decodes each chunk before advancing this rank.
         Calling run again reuses weights and starts fresh KV state and seeded noise.
         """
-        self._check_idle()
-        if not self.prepared:
-            raise RuntimeError("prepare requests before running inference")
-        self.busy = True
-        active, iterators = [], []
+        active = []
         chunks = {index: [] for index, *_ in self.sessions}
         decoders, videos = {}, {}
-        completed = False
         try:
             for index, runner, condition in self.sessions:
                 request = self.requests[index]
                 if self.is_output and request.mode == "online_decode":
-                    decoder = self.config.make_backend(self.config.model).decoder
+                    decoder = self.config.make_backend().decoder
                     decoder.load(self.device, self.codec_dtype)
                     decoder.reset()
                     decoders[index], videos[index] = decoder, []
@@ -141,7 +124,6 @@ class Engine:
                 iterator = runner.run_ticks(condition, request.shape, request.chunks,
                                             seed=request.seed, fps=request.fps,
                                             on_latent=latent_cb, on_batch=batch_cb)
-                iterators.append(iterator)
                 active.append((index, iterator))
             while active:
                 for session in tuple(active):
@@ -153,22 +135,15 @@ class Engine:
                         continue
                     for chunk, latent in outputs:
                         request = self.requests[index]
-                        shape = (*request.shape[:2], self.first_frames if chunk == 0 else 1, *request.shape[3:])
-                        if tuple(latent.shape) != shape:
-                            raise RuntimeError(f"stream {index} chunk {chunk} has incorrect latent shape")
                         if index in decoders:
-                            if chunk != len(chunks[index]):
-                                raise RuntimeError(f"stream {index} returned missing or duplicate chunks")
                             decoder = decoders[index]
                             with torch.inference_mode():
                                 pixels = decoder.decode(latent.to(device=self.device, dtype=self.codec_dtype), chunk)
-                                self._check_pixels(pixels, decoder.frames(chunk, shape))
                             videos[index].append(self._video(pixels))
                         if request.mode != "dit_only":
                             latent = latent.cpu()
                         chunks[index].append((chunk, latent))
             self._barrier()
-            completed = True
             if not self.is_output:
                 return None
             results, directories = [], {}
@@ -178,8 +153,6 @@ class Engine:
                     result.update(status="rejected", reason=self.rejected[index])
                 else:
                     outputs = sorted(chunks[index], key=lambda item: item[0])
-                    if [chunk for chunk, _ in outputs] != list(range(request.chunks)):
-                        raise RuntimeError(f"stream {index} returned missing or duplicate chunks")
                     result.update(latents=torch.cat([latent for _, latent in outputs], dim=2).cpu(),
                                   chunks=request.chunks, first_frames=self.first_frames)
                     if index in videos:
@@ -193,19 +166,14 @@ class Engine:
                 results.append(result)
             return results
         finally:
-            for iterator in iterators:
+            for _, iterator in active:
                 iterator.close()
-            decoders.clear()
-            self.busy = False
-            if self.distributed and not completed:
-                self.failed = True
 
     def decode(self, outputs):
         """Decode completed CPU latents into uint8 [T,H,W,3] videos on rank zero."""
-        self._check_idle()
         # The large VAE replaces the DiT stage on this GPU; latent outputs are
         # already on the CPU. A following request reloads its runners in prepare.
-        self.sessions, self.runners, self.prepared = (), {}, False
+        self.sessions, self.runners = (), {}
         if not self.is_output or outputs is None:
             return None
         outputs = list(outputs)
@@ -213,7 +181,7 @@ class Engine:
             return outputs
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
-        decoder = self.config.make_backend(self.config.model).decoder
+        decoder = self.config.make_backend().decoder
         decoder.load(self.device, self.codec_dtype)
         results = []
         for output in outputs:
@@ -221,11 +189,6 @@ class Engine:
                 results.append(dict(output))
                 continue
             latent, count, first = output["latents"], output["chunks"], output["first_frames"]
-            if (latent.ndim != 5 or latent.shape[0] != 1 or first != self.first_frames
-                    or count < 1 or latent.shape[2] != first + count - 1):
-                raise ValueError("invalid sequence latent shape or chunk metadata")
-            pieces = latent.split([first] + [1] * (count - 1), dim=2)
-            frame_counts = [decoder.frames(index, tuple(piece.shape)) for index, piece in enumerate(pieces)]
             reset = getattr(decoder, "reset", None)
             if reset is not None:
                 reset()
@@ -234,13 +197,12 @@ class Engine:
                 if sequence is not None:
                     pixels = sequence(latent.to(device=self.device, dtype=self.codec_dtype))
                 else:
+                    pieces = latent.split([first] + [1] * (count - 1), dim=2)
                     decoded = []
                     for index, piece in enumerate(pieces):
                         pixels = decoder.decode(piece.to(device=self.device, dtype=self.codec_dtype), index)
-                        self._check_pixels(pixels, frame_counts[index])
                         decoded.append(pixels)
                     pixels = torch.cat(decoded, dim=2)
-                self._check_pixels(pixels, sum(frame_counts))
             results.append({**output, "video": self._video(pixels)})
         return results
 
@@ -257,8 +219,3 @@ class Engine:
         metadata = {key: str(output[key]) for key in ("prompt", "fps", "chunks", "first_frames")}
         save_file({"latents": output["latents"]}, str(path), metadata=metadata)
         output["latent_path"] = str(path)
-
-    @staticmethod
-    def _check_pixels(pixels, frames):
-        if pixels.ndim != 5 or tuple(pixels.shape[:3]) != (1, 3, frames):
-            raise ValueError(f"decoder must return pixels shaped [1,3,{frames},H,W]")

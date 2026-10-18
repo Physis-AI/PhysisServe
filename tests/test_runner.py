@@ -15,7 +15,7 @@ from physisserve.engine.model_runner import ModelRunner, _execution_plan
 from physisserve.engine.sampler import Sampler
 from physisserve.engine.strategies import StageEqual, VirtualRank
 from physisserve.engine.strategies.placement import MappedLayout
-from physisserve.engine.transport import Distributed
+from physisserve.engine.transport import Distributed, Local
 
 
 SHAPE = (1, 2, 1, 2, 2)
@@ -87,7 +87,6 @@ def test_layouts_match_serial_clean_sink_and_bounded_history(layout, first_frame
         assert all(latent.shape[2] == 1 for _, latent in outputs[1:])
         actual = torch.cat([latent for _, latent in outputs], dim=2)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        assert not runner.busy
         if getattr(layout, "max_batch", 1) > 1:
             assert max(runner.dit.batch_sizes) > 1
 
@@ -122,23 +121,50 @@ def test_tick_counts_include_clean_sink_bootstrap(chunks):
         assert ticks[head.ticks:head.ticks + 4] == [[]] * 4
 
 
-def test_request_lock_and_failed_request_cleanup():
+@pytest.mark.parametrize("family", ["wan21_1p3b", "wan21_14b", "wan22_5b", "ltx2", "h3"])
+def test_native_clean_sink_pages_match_transfer_dtype(tmp_path, family):
+    from tests.test_models import tiny_transformer
+
+    torch.set_num_threads(1)
+    model, adapter, channels, text_dim = tiny_transformer(family)
+    model.save_pretrained(tmp_path)
+    dit = adapter(tmp_path, compute_dtype=torch.bfloat16) if family == "ltx2" else adapter(tmp_path)
+    state_dtype = torch.float32 if family == "ltx2" else torch.bfloat16
+    stages = set()
+
+    class SinkTransport(Local):
+        def transfer(self, items):
+            for tag, _, _, spec, tensors in items:
+                if isinstance(tag, tuple) and tag[0] == "sink":
+                    stages.add(tag[1:])
+                    assert len(tensors) == len(spec) == 2
+                    for tensor, (shape, dtype) in zip(tensors, spec):
+                        assert tensor.shape == shape
+                        assert tensor.dtype == dtype == torch.bfloat16
+            return super().transfer(items)
+
+    runner = ModelRunner(dit, SAMPLER, StageEqual(2), dtype=state_dtype, transport=SinkTransport())
+    outputs = list(runner.run({"text": torch.randn(1, 5, text_dim)},
+                              (1, channels, 1, 4, 4), 2, fps=24))
+    assert stages == {(step, block) for step in range(4) for block in range(dit.num_blocks)}
+    assert len(outputs) == 2
+    assert all(latent.dtype == state_dtype and torch.isfinite(latent).all() for _, latent in outputs)
+
+
+def test_closed_and_failed_requests_release_state_before_reuse():
     runner = ModelRunner(TinyDiT(), SAMPLER, StageEqual(2))
+    expected = list(runner.run(None, SHAPE, 4))
     active = runner.run_ticks(None, SHAPE, 4)
     next(active)
-    with pytest.raises(RuntimeError, match="one request at a time"):
-        next(runner.run(None, SHAPE, 4))
-    assert runner.busy
     active.close()
-    assert not runner.busy
+    torch.testing.assert_close(list(runner.run(None, SHAPE, 4)), expected, rtol=0, atol=0)
 
     def fail_after_batch(rank, size):
         raise RuntimeError("callback failed")
 
     with pytest.raises(RuntimeError, match="callback failed"):
         list(runner.run(None, SHAPE, 4, on_batch=fail_after_batch))
-    assert not runner.busy
-    assert len(list(runner.run(None, SHAPE, 2))) == 2
+    torch.testing.assert_close(list(runner.run(None, SHAPE, 4)), expected, rtol=0, atol=0)
 
 
 def test_rank_local_plans_preserve_transfer_order_and_credit_edges():
@@ -175,7 +201,6 @@ def _distributed_worker(rank, directory, strategy):
             torch.save(outputs, Path(directory) / "outputs.pt")
         else:
             assert outputs == [[], []]
-        assert all(not runner.busy for runner in runners)
     finally:
         dist.destroy_process_group()
 

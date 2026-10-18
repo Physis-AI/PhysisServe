@@ -23,7 +23,7 @@ import traceback
 import torch
 import torch.distributed as dist
 
-from .config import Config, resolve_model
+from .config import resolve_model
 from .engine.engine import Engine
 
 
@@ -56,7 +56,7 @@ class Workers:
     def execute(self, operation, args, kwargs):
         if operation == "_load":
             config, source = args
-            if dist.get_rank() != 0 and isinstance(config, Config):
+            if dist.get_rank() != 0:
                 config.model = resolve_model(source)
             self.engine = Engine(config, control_group=self.group)
             return None

@@ -150,8 +150,8 @@ def test_online_matches_offline_with_real_wan_vae(monkeypatch, tmp_path, residua
     config = FakeConfig()
     backend = config.make_backend
 
-    def with_real_vae(root):
-        result = backend(root)
+    def with_real_vae():
+        result = backend()
         result.decoder = WanDecoder(tmp_path)
         return result
 

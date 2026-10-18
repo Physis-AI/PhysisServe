@@ -128,9 +128,21 @@ def test_aggregate_work_is_shared_by_every_receive_and_flush(fake_distributed, m
     assert state.bus.inflight == []
 
 
-def test_operations_without_completion_handles_fail_explicitly(fake_distributed, monkeypatch):
-    monkeypatch.setattr(transport.dist, "batch_isend_irecv", lambda operations: [])
-    with pytest.raises(RuntimeError, match="no work handles"):
+def test_empty_and_local_transfers_need_no_backend_operations(fake_distributed):
+    state = fake_distributed
+    assert state.bus.transfer([]) == {}
+    tensors = (torch.ones(1),)
+    pending = state.bus.transfer([("local", 0, 0, SPEC, tensors)])
+    assert pending["local"].wait() is tensors
+    assert state.posted == state.works == state.bus.inflight == []
+
+
+def test_backend_failure_propagates(fake_distributed, monkeypatch):
+    def fail(operations):
+        raise RuntimeError("backend failed")
+
+    monkeypatch.setattr(transport.dist, "batch_isend_irecv", fail)
+    with pytest.raises(RuntimeError, match="backend failed"):
         fake_distributed.bus.transfer([("received", 1, 0, SPEC, None)])
 
 

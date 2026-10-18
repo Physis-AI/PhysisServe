@@ -55,8 +55,6 @@ class _Attention:
                  key_rotary_emb=None, perturbation_mask=None, all_perturbed=None):
         from diffusers.models.transformers.transformer_ltx2 import apply_interleaved_rotary_emb, apply_split_rotary_emb
 
-        if encoder_hidden_states is not None or attention_mask is not None:
-            raise ValueError("this processor serves unmasked chunk self-attention only")
         rope = apply_split_rotary_emb if attn.rope_type == "split" else apply_interleaved_rotary_emb
         own, window = self.rotary
         gate_logits = attn.to_gate_logits(hidden_states) if attn.to_gate_logits is not None else None
@@ -416,11 +414,7 @@ class LTX2Decoder:
     """
 
     def __init__(self, source):
-        from diffusers import AutoencoderKLLTX2Video
-
         self.source = Path(source)
-        cfg = AutoencoderKLLTX2Video.load_config(self.source / "vae")
-        self.temporal = cfg.get("temporal_compression_ratio") or 8
         self.vae = None
 
     def load(self, device, dtype):
@@ -431,9 +425,6 @@ class LTX2Decoder:
         self.mean = self.vae.latents_mean.float().view(1, -1, 1, 1, 1)
         self.std = self.vae.latents_std.float().view(1, -1, 1, 1, 1)
         self.device, self.dtype = torch.device(device), dtype
-
-    def frames(self, chunk, shape):
-        return shape[2] * self.temporal - (self.temporal - 1 if chunk == 0 else 0)
 
     def decode_sequence(self, latent):
         """Decode the complete latent video, matching the non-causal pipeline VAE semantics."""

@@ -7,7 +7,6 @@ re-embedded at read time on positions contiguous with the current chunk, with th
 ``_Attention``. The Wan 2.2 5B full-noise T2V path is supported;
 image-prefix TI2V is not (it needs image input and per-token clean/noisy timesteps).
 """
-import json
 from pathlib import Path
 
 import torch
@@ -40,7 +39,7 @@ def configure(config):
 def backend(root) -> Backend:
     """Build the Wan components with cached text projections and 512-token prompts."""
     root = Path(root)
-    return Backend(WanDiT(root / "transformer", cache_text_kv=True), WanEncoder(root), WanDecoder(root))
+    return Backend(WanDiT(root / "transformer"), WanEncoder(root), WanDecoder(root))
 
 
 def _rope(x, cosine, sine):
@@ -51,39 +50,21 @@ def _rope(x, cosine, sine):
     return result
 
 
-def _tensor_revision(value):
-    # Inference tensors have no version counter. Prepared conditioning is owned
-    # by the request and must stay immutable, as in the existing embedding cache.
-    return None if value.is_inference() else value._version
-
-
 class _CachedTextProjection(nn.Module):
-    """Bounded memo of the original projection, without changing its GEMM shape.
+    """Memoize eight immutable request tensors without changing projection shapes."""
 
-    The strong source reference prevents pointer reuse from becoming a cache hit.
-    Normal tensors also check their mutation counter. Only inference/no-grad calls
-    may reuse results; prepared inference tensors and model weights are immutable.
-    """
-
-    def __init__(self, module, capacity=8):
+    def __init__(self, module):
         super().__init__()
-        self.module, self.capacity, self.entries = module, capacity, []
-        self.train(module.training)
+        self.module, self.entries = module, []
 
     def forward(self, value):
-        if self.training or torch.is_grad_enabled():
-            return self.module(value)
-        revision = _tensor_revision(value)
-        for index, (source, version, result) in enumerate(self.entries):
+        for index, (source, result) in enumerate(self.entries):
             if source is value:
-                self.entries.pop(index)
-                if version == revision:
-                    self.entries.append((source, version, result))
-                    return result
-                break
+                self.entries.append(self.entries.pop(index))
+                return result
         result = self.module(value)
-        self.entries.append((value, revision, result))
-        if len(self.entries) > self.capacity:
+        self.entries.append((value, result))
+        if len(self.entries) > 8:
             self.entries.pop(0)
         return result
 
@@ -106,8 +87,6 @@ class _Attention:
         self.cache = None
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, rotary_emb=None):
-        if encoder_hidden_states is not None or attention_mask is not None:
-            raise ValueError("this processor serves unmasked chunk self-attention only")
         own, window = rotary_emb
         q = attn.norm_q(attn.to_q(hidden_states)).unflatten(2, (attn.heads, -1))
         k = attn.norm_k(attn.to_k(hidden_states)).unflatten(2, (attn.heads, -1)).transpose(1, 2)
@@ -125,11 +104,10 @@ class WanDiT:
     first_frames = 3
     sink_sigma = 0.0
 
-    def __init__(self, source, cache_text_kv=False):
+    def __init__(self, source):
         from diffusers import WanTransformer3DModel
 
         self.source = Path(source)
-        self.cache_text_kv = cache_text_kv
         self.config = WanTransformer3DModel.load_config(self.source)
         if self.config["in_channels"] != self.config["out_channels"] or self.config.get("image_dim") is not None:
             raise ValueError("WanDiT supports prompt-only checkpoints with matching input/output channels; "
@@ -196,31 +174,19 @@ class WanDiT:
         self.text = text.to(self.device, self.dtype)
         self.embeddings, self.rotary = {}, {}
         self._frame_cache = None
-        if self.cache_text_kv:
-            self._reset_text_kv_cache()
+        self._reset_text_kv_cache()
 
     def _reset_text_kv_cache(self):
-        """Install request-local caches only around known prompt-only processors.
-
-        Keep Diffusers' processor, attention backend, query path and rounding.
-        Added image K/V, fused projections and custom processors use their
-        original uncached modules. They are not silently reinterpreted as T2V.
-        """
-        from diffusers.models.transformers.transformer_wan import WanAttnProcessor
-
+        """Install the projection memos once, then clear them between requests."""
         self._text_batches = []
         for block in self.model.blocks.values():
             attn = block.attn2
             for name in ("to_k", "to_v", "norm_k"):
                 module = getattr(attn, name)
                 if isinstance(module, _CachedTextProjection):
-                    setattr(attn, name, module.module)
-            if (type(attn.processor) is not WanAttnProcessor
-                    or not attn.is_cross_attention or attn.fused_projections
-                    or attn.add_k_proj is not None or attn.add_v_proj is not None):
-                continue
-            for name in ("to_k", "to_v", "norm_k"):
-                setattr(attn, name, _CachedTextProjection(getattr(attn, name)))
+                    module.entries.clear()
+                else:
+                    setattr(attn, name, _CachedTextProjection(module))
 
     def _batch_text(self, texts):
         """Reuse identical ordered conditioning packs, not single-member K/V.
@@ -228,18 +194,12 @@ class WanDiT:
         Each first use still executes the original full-batch projection. The
         cache distinguishes member order and size, and retains at most 8 packs.
         """
-        if not self.cache_text_kv or torch.is_grad_enabled():
-            return torch.cat(texts, dim=0)
-        versions = tuple(_tensor_revision(text) for text in texts)
-        for index, (sources, revisions, result) in enumerate(self._text_batches):
+        for index, (sources, result) in enumerate(self._text_batches):
             if len(sources) == len(texts) and all(a is b for a, b in zip(sources, texts)):
-                self._text_batches.pop(index)
-                if revisions == versions:
-                    self._text_batches.append((sources, revisions, result))
-                    return result
-                break
+                self._text_batches.append(self._text_batches.pop(index))
+                return result
         result = torch.cat(texts, dim=0)
-        self._text_batches.append((tuple(texts), versions, result))
+        self._text_batches.append((tuple(texts), result))
         if len(self._text_batches) > 8:
             self._text_batches.pop(0)
         return result
@@ -393,8 +353,6 @@ class WanDecoder:
     def __init__(self, source):
         self.root = Path(source)
         self.vae = None
-        cfg = json.loads((self.root / "vae" / "config.json").read_text())
-        self.temporal = cfg.get("scale_factor_temporal") or 4  # known before loading: frame counts need no VAE
 
     def load(self, device, dtype):
         from diffusers import AutoencoderKLWan
@@ -404,9 +362,6 @@ class WanDecoder:
         cfg = self.vae.config
         self.mean = torch.tensor(cfg.latents_mean, device=device, dtype=dtype).view(1, -1, 1, 1, 1)
         self.std = torch.tensor(cfg.latents_std, device=device, dtype=dtype).view(1, -1, 1, 1, 1)
-
-    def frames(self, chunk, shape):
-        return shape[2] * self.temporal - (self.temporal - 1 if chunk == 0 else 0)
 
     def reset(self):
         self.vae.clear_cache()

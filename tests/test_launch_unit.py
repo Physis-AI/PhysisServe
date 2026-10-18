@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from physisserve.config import Config
 from physisserve.engine.engine import Engine
 from physisserve import launch
 from tests.test_engine import FakeConfig
@@ -38,8 +37,7 @@ def test_worker_resolves_hugging_face_id_in_its_own_cache(monkeypatch):
     monkeypatch.setattr(launch, "resolve_model", resolve)
     monkeypatch.setattr(launch, "Engine", lambda config, control_group:
                         SimpleNamespace(config=config, group=control_group))
-    config = Config.__new__(Config)
-    config.model = "/node-0/cache/model"
+    config = SimpleNamespace(model="/node-0/cache/model")
     group = object()
     workers = launch.Workers("cpu", group, store=None)
     assert workers.execute("_load", (config, "org/model"), {}) is None
