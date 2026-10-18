@@ -13,21 +13,68 @@ Caught worker errors stop the pool; native crashes still rely on backend timeout
 """
 import argparse
 from datetime import timedelta
+from multiprocessing.connection import wait
 import os
 from pathlib import Path
 import runpy
 import sys
+from tempfile import TemporaryDirectory
 from threading import Event, Thread
+from time import monotonic
 import traceback
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from .config import resolve_model
 from .engine.engine import Engine
 
 
 _workers = None
+
+
+def ranks(requested):
+    if _workers is None:
+        return requested
+    world = dist.get_world_size()
+    if type(requested) is not int or requested not in (1, world):
+        raise ValueError("pipeline_parallel_size must be 1 or match the launch WORLD_SIZE")
+    return world
+
+
+def load(config, source):
+    workers = _workers if _workers is not None else Workers(config.device)
+    workers.load(config, source)
+    return workers
+
+
+def _execute(engine, operation, args, kwargs):
+    if isinstance(operation, str):
+        return getattr(engine, operation)(*args, **kwargs)
+    return operation(engine, *args, **kwargs)
+
+
+def _worker(rank, config, rendezvous, connection):
+    try:
+        if config.device == "cuda":
+            torch.cuda.set_device(rank)
+        dist.init_process_group("nccl" if config.device == "cuda" else "gloo",
+                                init_method=rendezvous, rank=rank, world_size=config.ranks,
+                                timeout=timedelta(minutes=30))
+        engine = Engine(config)
+        connection.send((True, None))
+        while True:
+            message = connection.recv()
+            if message is None:
+                break
+            connection.send((True, _execute(engine, *message)))
+    except BaseException:
+        connection.send((False, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        connection.close()
 
 
 def _watch_failure(store, finished):
@@ -48,10 +95,42 @@ def _watch_failure(store, finished):
 
 
 class Workers:
-    def __init__(self, device, group, store):
+    def __init__(self, device, group=None, store=None):
         self.device, self.group, self.store = device, group, store
-        self.engine, self.owner = None, None
+        self.engine = None
+        self.processes, self.connections = [], []
+        self.rendezvous = None
         self.failed = False
+
+    def load(self, config, source):
+        if self.engine is not None or self.processes:
+            raise RuntimeError("close the current PhysisServe before opening another on this launch")
+        if config.device != self.device:
+            raise ValueError("PhysisServe device must match the launch --device")
+        if self.group is None and self.device == "cuda" and torch.cuda.device_count() < config.ranks:
+            raise ValueError(f"requested {config.ranks} GPUs, found {torch.cuda.device_count()}")
+        try:
+            if self.group is not None:
+                path = Path(source).expanduser()
+                source = str(path.resolve()) if path.is_dir() else str(source)
+                self.call("_load", config, source)
+            elif config.ranks == 1:
+                self.engine = Engine(config)
+            else:
+                self.rendezvous = TemporaryDirectory(prefix="physisserve-")
+                address = Path(self.rendezvous.name, "rendezvous").as_uri()
+                context = mp.get_context("spawn")
+                for rank in range(config.ranks):
+                    parent, child = context.Pipe()
+                    process = context.Process(target=_worker, args=(rank, config, address, child))
+                    process.start()
+                    child.close()
+                    self.connections.append(parent)
+                    self.processes.append(process)
+                self._receive()
+        except BaseException:
+            self.close()
+            raise
 
     def execute(self, operation, args, kwargs):
         if operation == "_load":
@@ -65,11 +144,35 @@ class Workers:
             if self.device == "cuda":
                 torch.cuda.empty_cache()
             return None
-        from .serve import _execute
-
         return _execute(self.engine, operation, args, kwargs)
 
+    def _receive(self):
+        pending = dict(enumerate(self.connections))
+        results = [None] * len(pending)
+        while pending:
+            sentinels = [process.sentinel for process in self.processes]
+            ready = wait([*pending.values(), *sentinels], timeout=1800)
+            if not ready:
+                raise TimeoutError("GPU workers did not respond within 30 minutes")
+            for rank, connection in tuple(pending.items()):
+                if connection in ready:
+                    ok, result = connection.recv()
+                    if not ok:
+                        raise RuntimeError(f"worker {rank} failed:\n{result}")
+                    results[rank] = result
+                    del pending[rank]
+            if pending and any(process.sentinel in ready for process in self.processes):
+                raise RuntimeError("a GPU worker exited before completing the request")
+        return results
+
     def call(self, operation, *args, **kwargs):
+        if self.group is None:
+            if self.engine is not None:
+                return [_execute(self.engine, operation, args, kwargs)]
+            for rank, connection in enumerate(self.connections):
+                remote_args = (None,) if operation == "decode" and rank != 0 else args
+                connection.send((operation, remote_args, kwargs))
+            return self._receive()
         if self.failed:
             raise RuntimeError("distributed workers failed; restart the launch")
         # Never issue cleanup collectives after a partial command: peers may
@@ -108,23 +211,35 @@ class Workers:
     def report_failure(self):
         self.store.compare_set("error", "", f"rank {os.environ['RANK']} failed:\n{traceback.format_exc()}")
 
-    def load(self, owner, config, source):
-        if self.owner is not None:
-            raise RuntimeError("close the current PhysisServe before opening another on this launch")
-        if config.device != self.device:
-            raise ValueError("PhysisServe device must match the launch --device")
-        self.owner = owner
-        path = Path(source).expanduser()
-        if path.is_dir():
-            source = str(path.resolve())
-        self.call("_load", config, str(source))
-
-    def release(self, owner):
-        if self.owner is owner:
-            self.owner = None
-            if not self.failed:
+    def close(self):
+        if self.group is not None:
+            if self.engine is not None and not self.failed:
                 self.call("_close")
             self.engine = None
+            return
+        for connection in self.connections:
+            try:
+                connection.send(None)
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+        deadline = monotonic() + 5
+        for process in self.processes:
+            process.join(timeout=max(0, deadline - monotonic()))
+        for process in self.processes:
+            if process.is_alive():
+                process.terminate()
+        for process in self.processes:
+            process.join(timeout=1)
+        for connection in self.connections:
+            connection.close()
+        self.connections.clear()
+        self.processes.clear()
+        self.engine = None
+        if self.rendezvous is not None:
+            self.rendezvous.cleanup()
+            self.rendezvous = None
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
 
 
 def main():
@@ -163,8 +278,7 @@ def main():
                 runpy.run_path(str(script), run_name="__main__")
             finally:
                 if not _workers.failed:
-                    if _workers.owner is not None:
-                        _workers.owner.close()
+                    _workers.close()
                     dist.broadcast_object_list([None], src=0, group=group)
         else:
             _workers.listen()

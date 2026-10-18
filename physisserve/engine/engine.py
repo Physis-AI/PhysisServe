@@ -34,7 +34,7 @@ class Engine:
         self.blocks, self.first_frames = backend.dit.num_blocks, backend.dit.first_frames
         self.sampler = config.make_sampler()
         self.runners = {}
-        self.requests, self.sessions, self.rejected = (), (), {}
+        self.prompts, self.sampling_params, self.sessions, self.rejected = (), (), (), {}
 
     @property
     def is_output(self):
@@ -46,17 +46,18 @@ class Engine:
                 torch.cuda.synchronize(self.device)
             dist.barrier(group=self.control_group)
 
-    def prepare(self, requests, candidates=None, budgets=()):
+    def prepare(self, prompts, sampling_params, candidates=None, budgets=()):
         """Encode prompts and load independent stream weights before inference.
 
         Measured candidates use stringified input indices and budgets in GPU-rank
         order. Without a resource profile, every stream uses the configured layout
         over the whole pool. Matching runner slots retain weights across calls.
         """
-        self.requests, self.sessions = tuple(requests), ()
+        self.prompts, self.sampling_params = tuple(prompts), tuple(sampling_params)
+        self.sessions = ()
         if candidates is None:
             layout = self.config.make_layout()
-            layouts = dict.fromkeys(range(len(self.requests)), layout)
+            layouts = dict.fromkeys(range(len(self.prompts)), layout)
             self.rejected = {}
         else:
             placement = plan_pool(candidates, budgets)
@@ -76,7 +77,7 @@ class Engine:
             with torch.inference_mode():
                 for index in sorted(layouts):
                     conditions[index] = {key: value.cpu() for key, value in
-                                         encoder.encode(self.requests[index].prompt).items()}
+                                         encoder.encode(self.prompts[index]).items()}
             del encoder
         if self.distributed:
             payload = [conditions]
@@ -111,8 +112,8 @@ class Engine:
         decoders, videos = {}, {}
         try:
             for index, runner, condition in self.sessions:
-                request = self.requests[index]
-                if self.is_output and request.mode == "online_decode":
+                params = self.sampling_params[index]
+                if self.is_output and params.mode == "online_decode":
                     decoder = self.config.make_backend().decoder
                     decoder.load(self.device, self.codec_dtype)
                     decoder.reset()
@@ -121,8 +122,10 @@ class Engine:
                              lambda chunk, value, index=index: on_latent(index, chunk, value))
                 batch_cb = (None if on_batch is None else
                             lambda rank, size, index=index: on_batch(index, rank, size))
-                iterator = runner.run_ticks(condition, request.shape, request.chunks,
-                                            seed=request.seed, fps=request.fps,
+                shape = (1, self.config.channels, 1, params.height // self.config.spatial_scale,
+                         params.width // self.config.spatial_scale)
+                iterator = runner.run_ticks(condition, shape, params.num_chunks,
+                                            seed=params.seed, fps=self.config.fps,
                                             on_latent=latent_cb, on_batch=batch_cb)
                 active.append((index, iterator))
             while active:
@@ -134,31 +137,31 @@ class Engine:
                         active.remove(session)
                         continue
                     for chunk, latent in outputs:
-                        request = self.requests[index]
+                        params = self.sampling_params[index]
                         if index in decoders:
                             decoder = decoders[index]
                             with torch.inference_mode():
                                 pixels = decoder.decode(latent.to(device=self.device, dtype=self.codec_dtype), chunk)
                             videos[index].append(self._video(pixels))
-                        if request.mode != "dit_only":
+                        if params.mode != "dit_only":
                             latent = latent.cpu()
                         chunks[index].append((chunk, latent))
             self._barrier()
             if not self.is_output:
                 return None
             results, directories = [], {}
-            for index, request in enumerate(self.requests):
-                result = {"prompt": request.prompt, "fps": request.fps}
+            for index, (prompt, params) in enumerate(zip(self.prompts, self.sampling_params)):
+                result = {"prompt": prompt, "fps": self.config.fps}
                 if index in self.rejected:
                     result.update(status="rejected", reason=self.rejected[index])
                 else:
                     outputs = sorted(chunks[index], key=lambda item: item[0])
                     result.update(latents=torch.cat([latent for _, latent in outputs], dim=2).cpu(),
-                                  chunks=request.chunks, first_frames=self.first_frames)
+                                  chunks=params.num_chunks, first_frames=self.first_frames)
                     if index in videos:
                         result["video"] = torch.cat(videos[index], dim=0)
-                    if request.latent_dir is not None or request.mode == "offline_decode":
-                        root = Path(request.latent_dir or "latents").expanduser().resolve()
+                    if params.latent_dir is not None or params.mode == "offline_decode":
+                        root = Path(params.latent_dir or "latents").expanduser().resolve()
                         if root not in directories:
                             root.mkdir(parents=True, exist_ok=True)
                             directories[root] = Path(mkdtemp(prefix="generate-", dir=root))

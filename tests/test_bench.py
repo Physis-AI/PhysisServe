@@ -10,16 +10,17 @@ def row(stream, times, batch):
     return {"times": {stream: list(enumerate(times))}, "max_batch": batch}
 
 
-def test_benchmark_requests_are_dit_only_for_both_strategies(monkeypatch):
+def test_benchmark_inputs_are_dit_only_for_both_strategies(monkeypatch):
     services = []
 
     def make_service(model, **kwargs):
         service = PhysisServe.__new__(PhysisServe)
         service.config = fake_config(model, **kwargs)
 
-        def measure(operation, requests, warmups, repeats):
+        def measure(operation, prompts, params, warmups, repeats):
             assert operation is bench.measure
-            assert [request.mode for request in requests] == ["dit_only"]
+            assert prompts == ["A corgi running along a beach at sunset."]
+            assert [param.mode for param in params] == ["dit_only"]
             return [[row(0, [1, 2, 3], 1)]]
 
         service._call = measure

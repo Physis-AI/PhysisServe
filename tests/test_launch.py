@@ -32,9 +32,9 @@ def engine_state(engine):
     }
 
 
-def cpu_measure(engine, requests, warmups, repeats):
+def cpu_measure(engine, prompts, params, warmups, repeats):
     """Use wall time for the CPU fixture while exercising bench's real engines."""
-    engine.prepare(requests)
+    engine.prepare(prompts, params)
     for _ in range(warmups):
         engine.run()
     measurements = []

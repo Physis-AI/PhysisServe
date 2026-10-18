@@ -9,9 +9,9 @@ import torch
 from physisserve import PhysisServe, SamplingParams
 
 
-def measure(engine, requests, warmups, repeats):
+def measure(engine, prompts, params, warmups, repeats):
     """Worker-side DiT timing. Prompt encoding, loading, CPU copies and VAE are excluded."""
-    engine.prepare(requests)
+    engine.prepare(prompts, params)
     for _ in range(warmups):
         engine.run()
     measurements = []
@@ -103,8 +103,8 @@ def main():
                               max_batch_size=1 if strategy == "stage_equal" else args.max_batch_size,
                               batch_costs=batch_costs if strategy == "virtual_rank" else None)
         try:
-            requests = service._requests(prompts, params)
-            values = service._call(measure, requests, args.warmups, args.repeats)
+            inputs = service._inputs(prompts, params)
+            values = service._call(measure, *inputs, args.warmups, args.repeats)
             reports[strategy] = summarize(values, args.streams, args.chunks, args.repeats, args.skip_chunks)
         finally:
             service.close()

@@ -52,7 +52,7 @@ def test_decode_payload_and_root_results_stay_local(monkeypatch):
     monkeypatch.setattr(launch.dist, "get_world_size", lambda: 2)
     monkeypatch.setattr(launch.dist, "broadcast_object_list", lambda payload, **kwargs: sent.append(payload))
     monkeypatch.setattr(launch.dist, "gather_object", lambda value, results, **kwargs: gathered.append(value))
-    workers = launch.Workers("cpu", None, store=None)
+    workers = launch.Workers("cpu", object(), store=None)
     monkeypatch.setattr(workers, "execute", lambda operation, args, kwargs: args[0])
     assert workers.call("decode", output) == [output, None]
     assert sent == [[("decode", (None,), {})]]

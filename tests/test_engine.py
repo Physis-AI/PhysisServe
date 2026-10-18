@@ -11,7 +11,7 @@ from physisserve.engine.kv_cache import BatchCache, Cache
 from physisserve.engine.sampler import Sampler
 from physisserve.engine.strategies import StageEqual, VirtualRank
 from physisserve.engine.strategies.placement import Candidate, DeviceBudget, RankDemand, StreamCandidates
-from physisserve.sampling_params import Request
+from physisserve.sampling_params import SamplingParams
 
 
 @pytest.mark.parametrize("history_lengths", [(), (3, 1, 1)])
@@ -51,6 +51,7 @@ class FakeDiT:
 
     def prepare(self, condition, shape, chunks, fps=None):
         self.condition = condition["text"].item()
+        assert fps is None or fps == self.config.fps
 
     def prepare_timesteps(self, timesteps):
         pass
@@ -122,6 +123,8 @@ class SequenceDecoder(FakeDecoder):
 
 class FakeConfig:
     device, dtype, compute_dtype, encoder_device, model = "cpu", "float32", None, "cpu", "fake"
+    channels, height, width, spatial_scale, patch_size = 2, 2, 2, 1, (1, 1, 1)
+    chunks, fps, backend, supports_online_decode, min_decode_chunks = 5, 16, "fake", True, 1
 
     def __init__(self, strategy="virtual_rank", first_frames=3, sequence=False, ranks=1):
         self.strategy, self.first_frames, self.sequence, self.ranks = strategy, first_frames, sequence, ranks
@@ -139,22 +142,23 @@ class FakeConfig:
         return Sampler((1.0, 0.75, 0.5, 0.25, 0.0), (1000.0, 750.0, 500.0, 250.0))
 
 
-def requests():
-    return [Request("cat", (1, 2, 1, 2, 2), 5, 3, 16),
-            Request("dog", (1, 2, 1, 2, 2), 4, 8, 24)]
+def inputs():
+    return ["cat", "dog"], [SamplingParams(num_chunks=chunks, height=2, width=2, seed=seed, mode="dit_only")
+                           for chunks, seed in ((5, 3), (4, 8))]
 
 
 @pytest.mark.parametrize("strategy", ["stage_equal", "virtual_rank"])
 @pytest.mark.parametrize("first_frames", [1, 3])
 def test_interleaved_streams_equal_independent_requests_and_reuse_weights(strategy, first_frames):
+    prompts, params = inputs()
     expected = []
-    for request in requests():
+    for prompt, param in zip(prompts, params):
         single = Engine(FakeConfig(strategy, first_frames))
-        single.prepare([request])
+        single.prepare([prompt], [param])
         expected.append(single.run()[0]["latents"])
     config = FakeConfig(strategy, first_frames)
     engine = Engine(config)
-    engine.prepare(requests())
+    engine.prepare(prompts, params)
     batches, completions, latent_shapes = [], [], {}
 
     def completed(index, chunk, latent):
@@ -164,20 +168,21 @@ def test_interleaved_streams_equal_independent_requests_and_reuse_weights(strate
     results = engine.run(on_batch=lambda index, rank, size: batches.append(index),
                          on_latent=completed)
     assert batches[:2] == [0, 1]
-    assert completions.index((1, 0)) < completions.index((0, requests()[0].chunks - 1))
+    assert completions.index((1, 0)) < completions.index((0, params[0].num_chunks - 1))
     assert len(config.loaded) == 2 and config.encoder_loads == 1 and config.decoder_loads == 0
     assert [output["prompt"] for output in results] == ["cat", "dog"]
     for index, (output, reference) in enumerate(zip(results, expected)):
-        request = requests()[index]
-        assert [chunk for stream, chunk in completions if stream == index] == list(range(request.chunks))
-        for chunk in range(request.chunks):
+        param = params[index]
+        assert [chunk for stream, chunk in completions if stream == index] == list(range(param.num_chunks))
+        for chunk in range(param.num_chunks):
             frames = first_frames if chunk == 0 else 1
-            assert latent_shapes[index, chunk] == (*request.shape[:2], frames, *request.shape[3:])
-        assert output["chunks"] == request.chunks and output["first_frames"] == first_frames
+            assert latent_shapes[index, chunk] == (1, config.channels, frames, param.height, param.width)
+        assert output["chunks"] == param.num_chunks and output["first_frames"] == first_frames
+        assert output["fps"] == config.fps
         torch.testing.assert_close(output["latents"], reference, rtol=0, atol=0)
         assert output["latents"].device.type == "cpu" and output["latents"].is_contiguous()
     again = engine.run()
-    engine.prepare(list(reversed(requests())))
+    engine.prepare(list(reversed(prompts)), list(reversed(params)))
     swapped = engine.run()
     assert len(config.loaded) == 2
     for index in range(2):
@@ -189,7 +194,7 @@ def test_interleaved_streams_equal_independent_requests_and_reuse_weights(strate
 def test_offline_decode_resets_each_video_and_accounts_for_first_chunk(sequence, monkeypatch):
     config = FakeConfig(sequence=sequence)
     engine = Engine(config)
-    engine.prepare(requests())
+    engine.prepare(*inputs())
     outputs = engine.run()
     assert config.decoder_loads == 0
     load = FakeDecoder.load
@@ -208,7 +213,7 @@ def test_offline_decode_resets_each_video_and_accounts_for_first_chunk(sequence,
         assert output["video"].shape == (raw["latents"].shape[2] * 2 - 1, 2, 2, 3)
     if sequence:
         assert config.sequences == [tuple(output["latents"].shape) for output in outputs]
-    engine.prepare(requests())
+    engine.prepare(*inputs())
     assert len(engine.run()) == 2
 
 
@@ -218,39 +223,40 @@ def test_placement_preserves_input_order_and_reports_rejections_without_loading(
     candidate = Candidate("one", StageEqual(1), (RankDemand(1, 0.1),), 1.0)
     too_large = Candidate("two", StageEqual(1), (RankDemand(2, 0.1),), 1.0)
     candidates = [StreamCandidates("0", 2.0, (too_large,)), StreamCandidates("1", 2.0, (candidate,))]
-    engine.prepare(requests(), candidates, [DeviceBudget(1)])
+    engine.prepare(*inputs(), candidates, [DeviceBudget(1)])
     results = engine.run()
     assert results[0] == {"prompt": "cat", "fps": 16, "status": "rejected",
                           "reason": "no placement found by this bounded policy; infeasibility not proved"}
     assert results[1]["prompt"] == "dog" and results[1]["latents"].shape[2] == 6
     assert len(config.loaded) == 1 and config.encoded == ["dog"]
     assert engine.decode(results)[0] == results[0]
-    engine.prepare([])
+    engine.prepare([], [])
     assert engine.run() == [] and not engine.runners
 
 
 @pytest.mark.parametrize("layout", [StageEqual(2), VirtualRank(2)])
 def test_internal_pool_colocates_stream_stages_without_changing_single_stream_latents(layout):
+    prompts, params = inputs()
     single = Engine(FakeConfig("stage_equal"))
     expected = []
-    for request in requests():
-        single.prepare([request])
+    for prompt, param in zip(prompts, params):
+        single.prepare([prompt], [param])
         expected.append(single.run()[0]["latents"])
 
     candidate = Candidate("two ranks", layout, (RankDemand(1, 0.1),) * 2, 1.0)
     candidates = [StreamCandidates(str(index), 2.0, (candidate,)) for index in range(2)]
     engine = Engine(FakeConfig())
-    engine.prepare(requests(), candidates, [DeviceBudget(4)])
+    engine.prepare(prompts, params, candidates, [DeviceBudget(4)])
     assert all(runner.layout.rank_map == (0, 0) for _, runner in engine.runners.values())
     outputs = engine.run()
-    assert [output["prompt"] for output in outputs] == [request.prompt for request in requests()]
+    assert [output["prompt"] for output in outputs] == prompts
     for output, latent in zip(outputs, expected):
         torch.testing.assert_close(output["latents"], latent, rtol=0, atol=0)
 
 
 def test_failed_callback_closes_stream_iterators_before_reuse(monkeypatch):
     engine = Engine(FakeConfig())
-    engine.prepare(requests())
+    engine.prepare(*inputs())
     closed = []
     for _, runner in engine.runners.values():
         run_ticks = runner.run_ticks
@@ -281,16 +287,18 @@ def distributed_worker(rank, rendezvous):
         # Rank zero receives every output even when it owns no model blocks.
         candidate = Candidate("one", StageEqual(1), (RankDemand(1, 0.1),), 1.0)
         candidates = [StreamCandidates(str(index), 2.0, (candidate,)) for index in range(2)]
-        engine.prepare(requests(), candidates, [DeviceBudget(10), DeviceBudget(2)])
+        prompts, params = inputs()
+        engine.prepare(prompts, params, candidates, [DeviceBudget(10), DeviceBudget(2)])
         assert all(runner.layout.rank_map == (1,) for _, runner in engine.runners.values())
         results = engine.run()
         if rank == 0:
             assert len(results) == 2
-            for request, result in zip(requests(), results):
+            for prompt, param, result in zip(prompts, params, results):
                 reference = FakeDiT(FakeConfig())
                 from tests.reference import run
-                condition = {"text": torch.tensor([sum(map(ord, request.prompt))], dtype=torch.float32)}
-                expected = run(reference, config.make_sampler(), condition, request.shape, request.chunks, seed=request.seed)
+                condition = {"text": torch.tensor([sum(map(ord, prompt))], dtype=torch.float32)}
+                shape = (1, config.channels, 1, param.height, param.width)
+                expected = run(reference, config.make_sampler(), condition, shape, param.num_chunks, seed=param.seed)
                 torch.testing.assert_close(result["latents"], expected, rtol=0, atol=0)
             assert all(not dit.loaded for dit in config.loaded)
         else:

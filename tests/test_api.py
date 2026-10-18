@@ -42,7 +42,7 @@ def test_standard_diffusers_profiles(tmp_path, name, channels, blocks, backend, 
     }))
     config = Config(str(tmp_path))
     assert vars(pickle.loads(pickle.dumps(config))) == vars(config)
-    request = SamplingParams().request("cat", config)
+    params = SamplingParams().resolve(config)
     assert (config.backend, config.num_blocks, config.channels) == (backend, blocks, channels)
     assert (config.height, config.width, config.spatial_scale) == dimensions
     assert (config.chunks, config.fps) == (chunks, fps)
@@ -53,10 +53,12 @@ def test_standard_diffusers_profiles(tmp_path, name, channels, blocks, backend, 
     assert config.sigmas == sigmas and config.timesteps == timesteps
     sampler = config.make_sampler()
     assert sampler.sigmas == sigmas and sampler.timesteps == timesteps
-    assert request.shape == shape and request.chunks == chunks and request.fps == fps
-    assert request.mode == "offline_decode" and request.latent_dir is None
+    assert (1, config.channels, 1, params.height // config.spatial_scale,
+            params.width // config.spatial_scale) == shape
+    assert params.num_chunks == chunks
+    assert params.mode == "offline_decode" and params.latent_dir is None
     with pytest.raises(ValueError, match="spatial patch"):
-        SamplingParams(width=831).request("cat", config)
+        SamplingParams(width=831).resolve(config)
     assert Config(str(tmp_path), strategy="stage_equal").max_batch == 1
     assert config.max_batch == 4
 
@@ -100,8 +102,8 @@ def test_model_dependent_config_is_rejected_before_engine_or_workers(monkeypatch
     def fail(*args, **kwargs):
         pytest.fail("invalid configuration must fail before loading an engine or starting workers")
 
-    monkeypatch.setattr("physisserve.serve.Engine", fail)
-    monkeypatch.setattr("physisserve.serve.mp.get_context", fail)
+    monkeypatch.setattr("physisserve.launch.Engine", fail)
+    monkeypatch.setattr("physisserve.launch.mp.get_context", fail)
     with pytest.raises(ValueError):
         PhysisServe(tmp_path, device="cpu", **options)
 
@@ -138,14 +140,14 @@ def test_example_direct_api_writes_videos(monkeypatch, tmp_path):
     def make_service(model, **kwargs):
         service = PhysisServe(model, device="cpu", **kwargs)
         services.append(service)
-        requests = service._requests
+        inputs = service._inputs
 
-        def record_requests(prompts, params):
-            result = requests(prompts, params)
-            modes.extend(request.mode for request in result)
+        def record_inputs(prompts, params):
+            result = inputs(prompts, params)
+            modes.extend(param.mode for param in result[1])
             return result
 
-        monkeypatch.setattr(service, "_requests", record_requests)
+        monkeypatch.setattr(service, "_inputs", record_inputs)
         return service
 
     monkeypatch.setattr(example, "PhysisServe", make_service)
@@ -165,6 +167,7 @@ def test_example_direct_api_writes_videos(monkeypatch, tmp_path):
 def test_public_generate_unifies_single_multiple_and_offline_video(monkeypatch, ranks):
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
     with PhysisServe("fake", device="cpu", pipeline_parallel_size=ranks) as model:
+        processes = list(model._workers.processes)
         params = SamplingParams(num_chunks=5, seed=17, mode="dit_only")
         single = model.generate("cat", params)
         assert len(single) == 1 and "video" not in single[0]
@@ -177,7 +180,8 @@ def test_public_generate_unifies_single_multiple_and_offline_video(monkeypatch, 
         again = model.generate("dog", SamplingParams(num_chunks=5, seed=17))
         torch.testing.assert_close(again[0]["video"], decoded[1]["video"], rtol=0, atol=0)
         assert model.generate([], params) == []
-    assert not model._processes and model._closed
+    assert model._workers is None and model._closed
+    assert not any(process.is_alive() for process in processes)
     with pytest.raises(RuntimeError, match="closed"):
         model.generate("cat", params)
 
@@ -191,15 +195,16 @@ def fail_worker(engine):
 def test_worker_failure_is_reported_and_processes_are_reaped(monkeypatch):
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
     with PhysisServe("fake", device="cpu", pipeline_parallel_size=2) as model:
-        processes = list(model._processes)
+        processes = list(model._workers.processes)
         with pytest.raises(RuntimeError, match="test worker failure"):
             model._call(fail_worker)
-        assert model._closed and not any(process.is_alive() for process in processes)
+        assert model._closed and model._workers is None
+        assert not any(process.is_alive() for process in processes)
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"num_chunks": 0}, {"height": -1}, {"seed": -1}, {"fps": True},
-    {"num_chunks": True}, {"height": 1.5}, {"width": 0}, {"fps": 0},
+    {"num_chunks": 0}, {"height": -1}, {"seed": -1},
+    {"num_chunks": True}, {"height": 1.5}, {"width": 0},
     {"seed": True}, {"seed": 2**31},
     {"mode": "video"}, {"mode": None}, {"mode": []},
     {"latent_dir": ""}, {"latent_dir": "  "}, {"latent_dir": 3},
@@ -210,12 +215,28 @@ def test_invalid_sampling_inputs(kwargs):
 
 
 @pytest.mark.parametrize("mode", ["dit_only", "offline_decode", "online_decode"])
-def test_sampling_mode_and_latent_directory_reach_request(tmp_path, mode):
+def test_sampling_mode_and_latent_directory_survive_resolution(tmp_path, mode):
     target = tmp_path / "latents"
     params = SamplingParams(mode=mode, latent_dir=str(target))
-    request = params.request("cat", fake_config("fake"))
-    assert request.mode == mode and request.latent_dir == target
+    resolved = params.resolve(fake_config("fake"))
+    assert resolved.mode == mode and resolved.latent_dir == target
     assert not target.exists()
+
+
+def test_sampling_defaults_remain_reusable_across_models():
+    params = SamplingParams(seed=17)
+    first = fake_config("first")
+    second = fake_config("second")
+    second.height, second.width, second.chunks = 4, 6, 7
+    a, b = params.resolve(first), params.resolve(second)
+    assert (params.height, params.width, params.num_chunks) == (None, None, None)
+    assert (a.height, a.width, a.num_chunks, a.seed) == (2, 2, 5, 17)
+    assert (b.height, b.width, b.num_chunks, b.seed) == (4, 6, 7, 17)
+
+
+def test_fps_is_not_a_sampling_parameter():
+    with pytest.raises(TypeError, match="fps"):
+        SamplingParams(fps=24)
 
 
 def test_latent_directory_rejects_file(tmp_path):
@@ -237,7 +258,8 @@ def test_mixed_modes_decode_after_all_streams_and_preserve_order_and_rejections(
     def call(operation, *args, **kwargs):
         events.append(operation)
         if operation == "prepare":
-            assert [request.mode for request in args[0]] == [
+            assert args[0] == [output["prompt"] for output in outputs]
+            assert [param.mode for param in args[1]] == [
                 "dit_only", "offline_decode", "online_decode", "offline_decode", "offline_decode"]
             return [None]
         if operation == "run":

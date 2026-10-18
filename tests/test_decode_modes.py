@@ -9,7 +9,6 @@ from safetensors.torch import load_file
 from physisserve import PhysisServe, SamplingParams
 from physisserve.engine.engine import Engine
 from physisserve.models.wan import WanDecoder
-from physisserve.sampling_params import Request
 from tests.test_api import fake_config
 from tests.test_engine import FakeConfig, FakeDecoder, FakeDiT
 
@@ -42,7 +41,7 @@ def test_decode_happens_at_the_selected_time_and_preserves_latents(monkeypatch, 
         assert (tmp_path / "latents").exists() == (mode == "offline_decode")
         if mode == "dit_only":
             assert all(kind == "dit" for kind, _ in events)
-            assert "video" not in output and model._engine.config.decoder_loads == 0
+            assert "video" not in output and model.config.decoder_loads == 0
         else:
             first_decode = next(index for index, event in enumerate(events) if event[0] == "vae")
             last_dit = max(index for index, event in enumerate(events) if event[0] == "dit")
@@ -143,6 +142,7 @@ def test_online_matches_offline_with_real_wan_vae(monkeypatch, tmp_path, residua
                      latents_mean=[0.1, -0.2, 0.3, 0.0], latents_std=[1.5, 0.8, 1.2, 1.0],
                      **options).save_pretrained(tmp_path / "vae")
     config = FakeConfig()
+    config.channels = 4
     backend = config.make_backend
 
     def with_real_vae():
@@ -152,11 +152,12 @@ def test_online_matches_offline_with_real_wan_vae(monkeypatch, tmp_path, residua
 
     monkeypatch.setattr(config, "make_backend", with_real_vae)
     engine = Engine(config)
-    requests = [Request(prompt, (1, 4, 1, 2, 2), 4, seed, 16, mode="online_decode")
-                for seed, prompt in enumerate(["cat", "dog"])]
-    engine.prepare(requests)
+    prompts = ["cat", "dog"]
+    params = [SamplingParams(num_chunks=4, height=2, width=2, seed=seed, mode="online_decode")
+              for seed in range(len(prompts))]
+    engine.prepare(prompts, params)
     online = engine.run()
-    engine.prepare([replace(request, mode="offline_decode") for request in requests])
+    engine.prepare(prompts, [replace(param, mode="offline_decode", latent_dir=tmp_path) for param in params])
     latents = engine.run()
     assert all("video" not in output for output in latents)
     offline = engine.decode(latents)
