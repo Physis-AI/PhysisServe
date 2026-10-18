@@ -85,8 +85,6 @@ class KVCache:
                 raise ValueError("KVCache requires a fixed rank for each (step, block)")
             if is_local(task.rank):
                 tasks.append(task)
-        if type(offset) is not int or offset < 0 or (offset and sink is None):
-            raise ValueError("offset must be a nonnegative integer, and a positive offset needs sink pages")
         self.sink = {} if sink is None else sink
         self.reads = {
             task: [(chunk - offset, task.step, task.block)

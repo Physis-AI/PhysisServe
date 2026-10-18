@@ -1,7 +1,6 @@
 import importlib
 import json
 import pickle
-from dataclasses import replace
 
 import pytest
 import torch
@@ -330,8 +329,7 @@ def test_invalid_generate_containers_fail_before_worker_call(prompts, params):
 @pytest.mark.parametrize("case", [
     "wrong_type", "pool_size", "missing", "duplicate", "unknown", "overlap",
     "physical_rank", "local_ranks", "cost_rows", "admission_window",
-    "placement_type", "candidate_type", "candidate_name", "empty_demands", "demand_type",
-    "load_type", "rejection_reason", "rank_map_length",
+    "placement_type", "candidate_type", "rejection_reason", "rank_map_length",
 ])
 def test_invalid_placement_fails_before_worker_call(case):
     demand = RankDemand(1, 0.1)
@@ -352,18 +350,12 @@ def test_invalid_placement_fails_before_worker_call(case):
         placements = (StreamPlacement("0", candidate, (1,)), placements[1])
     elif case == "placement_type":
         placements = (object(), placements[1])
-    elif case == "load_type":
-        loads = (object(),)
     elif case == "rejection_reason":
         placements, rejected = placements[:1], {"1": None}
     elif case == "rank_map_length":
         placements = (StreamPlacement("0", candidate, (0, 0)), placements[1])
-    elif case in ("candidate_type", "candidate_name", "empty_demands", "demand_type"):
-        candidate = {"candidate_type": object(),
-                     "candidate_name": replace(candidate, name=""),
-                     "empty_demands": replace(candidate, demands=()),
-                     "demand_type": replace(candidate, demands=(object(),))}[case]
-        placements = (StreamPlacement("0", candidate, (0,)), placements[1])
+    elif case == "candidate_type":
+        placements = (StreamPlacement("0", object(), (0,)), placements[1])
     elif case in ("local_ranks", "cost_rows", "admission_window"):
         layout = {"local_ranks": StageEqual(2),
                   "cost_rows": VirtualRank(1, batch_costs=[[1, 2, 3, 4]]),
@@ -391,35 +383,15 @@ def test_manual_placement_rejects_invalid_rank_maps_before_worker_call(rank, pro
         model.generate(prompts, SamplingParams(mode="dit_only"), placement=plan)
 
 
-@pytest.mark.parametrize("target", ["demand", "load"])
-@pytest.mark.parametrize("field,value", [
-    ("memory_bytes", -1), ("memory_bytes", 1.5), ("memory_bytes", True),
-    ("utilization", -0.1), ("utilization", True),
-    ("utilization", float("nan")), ("utilization", float("inf")),
-])
-def test_manual_placement_validates_resources_before_worker_call(target, field, value):
-    valid = RankDemand(1, 0.1)
-    invalid = replace(valid, **{field: value})
-    candidate = Candidate("one", StageEqual(1), (invalid if target == "demand" else valid,), 1.0)
-    plan = PoolPlan((StreamPlacement("0", candidate, (0,)),), {},
-                    (invalid if target == "load" else valid,))
-    model = PhysisServe.__new__(PhysisServe)
-    model.config = fake_config("fake")
-    model._call = lambda *args, **kwargs: pytest.fail("invalid resources must fail before worker calls")
-    with pytest.raises(ValueError):
-        model.generate("cat", SamplingParams(mode="dit_only"), placement=plan)
-
-
-@pytest.mark.parametrize("gap", [0, -1, True, float("nan"), float("inf")])
-def test_manual_placement_validates_candidate_gap_before_worker_call(gap):
-    demand = RankDemand(1, 0.1)
-    candidate = Candidate("one", StageEqual(1), (demand,), gap)
-    plan = PoolPlan((StreamPlacement("0", candidate, (0,)),), {}, (demand,))
-    model = PhysisServe.__new__(PhysisServe)
-    model.config = fake_config("fake")
-    model._call = lambda *args, **kwargs: pytest.fail("invalid gaps must fail before worker calls")
-    with pytest.raises(ValueError):
-        model.generate("cat", SamplingParams(mode="dit_only"), placement=plan)
+def test_placement_execution_ignores_planning_metadata(monkeypatch):
+    monkeypatch.setattr("physisserve.serve.Config", fake_config)
+    candidate = Candidate("", StageEqual(2), (), float("nan"))
+    plan = PoolPlan((StreamPlacement("0", candidate, (0, 0)),), {}, (RankDemand(-1, float("nan")),))
+    with PhysisServe("fake", device="cpu") as model:
+        params = SamplingParams(mode="dit_only", seed=17)
+        expected = model.generate("cat", params)[0]
+        actual = model.generate("cat", params, placement=plan)[0]
+    torch.testing.assert_close(actual["latents"], expected["latents"], rtol=0, atol=0)
 
 
 def test_manual_placement_rejects_custom_layouts_before_calling_them():

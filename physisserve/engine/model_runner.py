@@ -18,7 +18,7 @@ import torch.distributed as dist
 
 from .chunks import Chunks
 from .kv_cache import Cache, KVCache
-from .sampler import DENOISING_STEPS, Sampler
+from .sampler import DENOISING_STEPS
 from .scheduler import Task
 from .transport import Distributed, Local
 
@@ -81,23 +81,10 @@ class ModelRunner:
     def __init__(self, dit, sampler, layout, device="cpu", dtype=torch.float32,
                  transport=None, output_rank: int = 0):
         """A clean sink runs one extra model-native forward of chunk 0's final latent and pins its pages."""
-        if type(sampler) is not Sampler:
-            raise ValueError(f"ModelRunner requires the fixed {DENOISING_STEPS}-pass noisy Sampler")
-        first_frames, sink_sigma = getattr(dit, "first_frames", None), getattr(dit, "sink_sigma", None)
-        if type(first_frames) is not int or first_frames < 1:
-            raise TypeError("DiT.first_frames must be a positive integer")
-        if (isinstance(sink_sigma, bool) or not isinstance(sink_sigma, (int, float))
-                or not 0.0 <= sink_sigma < 1.0):
-            raise TypeError("DiT.sink_sigma must be a number in [0, 1)")
-        if not callable(getattr(dit, "timestep_for_sigma", None)):
-            raise TypeError("DiT.timestep_for_sigma must be callable")
-        self.dit, self._sampler, self.layout = dit, sampler, layout
-        self.first_frames, self.sink_sigma = first_frames, float(sink_sigma)
+        self.dit, self.sampler, self.layout = dit, sampler, layout
+        self.first_frames, self.sink_sigma = dit.first_frames, dit.sink_sigma
         self.device, self.dtype = torch.device(device), dtype
         ranks = layout.num_ranks(dit.num_blocks)
-        if getattr(layout, "max_batch", 1) > 1 and not callable(getattr(dit, "block_batch", None)):
-            raise ValueError("this strategy requires a backend with native block_batch support; "
-                             "select max_batch=1 or a supported backend")
         if transport is None:
             transport = Distributed(self.device) if dist.is_initialized() else Local()
         self.transport, self.output_rank = transport, output_rank
@@ -112,11 +99,6 @@ class ModelRunner:
             blocks = layout.rank_blocks(transport.rank, dit.num_blocks)
         dit.load(blocks, self.device, dtype)
         self.busy = False
-
-    @property
-    def sampler(self) -> Sampler:
-        """The immutable sampler admitted when this runner was built."""
-        return self._sampler
 
     def run(self, condition, shape, chunks: int, *, seed: int = 0, noise=None,
             fps: float | None = None, on_latent=None, on_batch=None) -> Iterator[tuple[int, torch.Tensor]]:
@@ -158,8 +140,6 @@ class ModelRunner:
             raise RuntimeError("a ModelRunner serves one request at a time; exhaust the previous run first")
         self.busy = True
         try:
-            if len(shape) != 5 or shape[2] != 1:
-                raise ValueError("PhysisServe requires exactly one temporal latent per chunk (shape[2] must be 1)")
             geometry = Chunks(shape, chunks, self.first_frames)
             schedules = _request_schedules(self.layout, self.dit.num_blocks, chunks)
             yield from self._run_sink_first(
@@ -167,15 +147,11 @@ class ModelRunner:
         finally:
             self.busy = False
 
-    def _execute_ticks(self, condition, shape, chunks, seed, noise, fps, on_latent,
-                       on_batch, schedule, kv, states, transfer, *, offset=0, prepared=False):
+    def _execute_ticks(self, shape, seed, noise, on_latent, on_batch, schedule, kv, states, transfer, *, offset=0):
         """``offset``: the schedule's chunk ``i`` is the request's chunk ``i + offset`` (noise, positions, outputs);
-        ``shape`` is the shape of the schedule's chunks. ``prepared``: the backend is already prepared for the
-        request."""
+        ``shape`` is the shape of the schedule's chunks. The backend is already prepared for the request."""
         local = self.transport.is_local
         device, dtype, shape = self.device, self.dtype, tuple(shape)
-        if not prepared:
-            self.dit.prepare(condition, shape, chunks, fps=fps)
         times = [torch.tensor(t, dtype=torch.float32) for t in self.sampler.timesteps]  # CPU scalars
         self.dit.prepare_timesteps(times)
         latent_spec, hidden_spec = (shape, dtype), (self.dit.hidden_shape(shape), self._hidden_dtype())
@@ -265,7 +241,7 @@ class ModelRunner:
     def _run_sink_first(self, condition, geometry, schedules, seed, noise, fps, on_latent, on_batch):
         """Chunk 0 to completion first, then (clean sink) its sink forward, then every later chunk.
 
-        Chunk 0 runs the layout's own one-chunk schedule in its own shape (``geometry.first`` latent frames).
+        Chunk 0 runs the layout's own one-chunk schedule in its own shape (``geometry.first_frames`` latent frames).
         The page of one extra forward of its final latent stays for the whole request. That forward runs block by block on
         the ranks that ran chunk 0's last pass; each page then goes to the rank that owns the reading stage, the
         only time KV moves. Later chunks run the layout's schedule of ``count - 1`` chunks, shifted by one chunk.
@@ -288,8 +264,7 @@ class ModelRunner:
         kv, states = KVCache(head, local), {}
         completed = False
         try:
-            yield from self._execute_ticks(condition, first_shape, chunks, seed, noise, fps, keep_final, on_batch,
-                                           head, kv, states, transfer, prepared=True)
+            yield from self._execute_ticks(first_shape, seed, noise, keep_final, on_batch, head, kv, states, transfer)
             completed = True
         finally:
             if not completed:
@@ -307,7 +282,7 @@ class ModelRunner:
         readers = {}
         for task in rest.tasks:
             readers.setdefault((task.step, task.block), task.rank)
-        page_spec = [(self.dit.kv_shape(first_shape), self._page_dtype())] * 2
+        page_spec = [(self.dit.kv_shape(first_shape), getattr(self.dit, "page_dtype", None) or self.dtype)] * 2
         items = []
         for stage in sorted(readers):
             _, block = stage
@@ -326,8 +301,8 @@ class ModelRunner:
         kv, states = KVCache(rest, local, offset=1, sink=sink), {}
         completed = False
         try:
-            execution = self._execute_ticks(condition, shape, chunks, seed, noise, fps, on_latent, on_batch,
-                                            rest, kv, states, transfer, offset=1, prepared=True)
+            execution = self._execute_ticks(shape, seed, noise, on_latent, on_batch,
+                                            rest, kv, states, transfer, offset=1)
             del rest
             yield from execution
             completed = True
@@ -340,10 +315,6 @@ class ModelRunner:
                 states.clear()
                 kv.pages.clear()
                 sink.clear()
-
-    def _page_dtype(self):
-        """dtype of the K/V pages the backend writes (they are checked against it before moving)."""
-        return getattr(self.dit, "page_dtype", None) or self.dtype
 
     def _hidden_dtype(self):
         """dtype of the hidden states between blocks (a backend computing under autocast declares its own)."""

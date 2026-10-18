@@ -76,8 +76,6 @@ class Distributed:
     """
 
     def __init__(self, device, group=None):
-        if not dist.is_initialized():
-            raise RuntimeError("Distributed transport requires init_process_group first")
         self.device, self.group = torch.device(device), group
         self.rank, self.world = dist.get_rank(group), dist.get_world_size(group)
         self.inflight = []  # (works, tensors) retained until the backend reports completion

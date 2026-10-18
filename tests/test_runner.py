@@ -130,8 +130,12 @@ def test_request_lock_and_failed_request_cleanup():
     assert runner.busy
     active.close()
     assert not runner.busy
-    with pytest.raises(ValueError, match="exactly one temporal latent"):
-        list(runner.run(None, (1, 2, 2, 2, 2), 4))
+
+    def fail_after_batch(rank, size):
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        list(runner.run(None, SHAPE, 4, on_batch=fail_after_batch))
     assert not runner.busy
     assert len(list(runner.run(None, SHAPE, 2))) == 2
 

@@ -17,7 +17,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ..engine.kv_cache import BatchCache
-from .base import Backend, block_indices, drop_attributes, load_selected_weights
+from .base import Backend, drop_attributes, load_selected_weights
 
 
 def configure(config):
@@ -78,8 +78,6 @@ def _video_positions(frames, height, width, patch_size, text_tokens, device):
     )
 
     frames = torch.as_tensor(frames, dtype=torch.long)
-    if not frames.numel() or int(frames.min()) < 0:
-        raise ValueError("H3 frame positions must be nonempty and nonnegative")
     _, ph, pw = patch_size
     spatial, _ = _frame_position_grid(height, width, ph, pw)
     clock = _temporal_position_grid(int(frames.max()) + 1, float(text_tokens)).index_select(0, frames)
@@ -173,7 +171,7 @@ class H3DiT:
         from diffusers import MiniMaxH3Transformer3DModel
         from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3RotaryPosEmbed
 
-        blocks = block_indices(blocks, self.num_blocks)
+        blocks = tuple(blocks)
         with torch.device("meta"):
             model = MiniMaxH3Transformer3DModel.from_config(self.config)
         model.transformer_blocks = nn.ModuleDict({str(i): model.transformer_blocks[i] for i in blocks})
@@ -205,16 +203,13 @@ class H3DiT:
         self._batch_conditioning_cache = self._batch_rotary_cache = None
         del fps
         shape = tuple(shape)
-        cfg, b, c, t, h, w = self.config, *shape
-        pt, ph, pw = cfg["patch_size"]
-        if c != cfg["in_channels"] or t % pt or h % ph or w % pw:
-            raise ValueError("H3 requires checkpoint channels and patch-aligned T/H/W")
+        cfg, b = self.config, shape[0]
         text = condition.get("text")
         if text is None or text.ndim != 3 or text.shape[0] != b or text.shape[2] != cfg["text_dim"]:
             raise ValueError("condition['text'] must be [B, L, text_dim]")
         if text.shape[1] < 1:
             raise ValueError("H3 requires at least one text token")
-        self.shape = tuple(shape)
+        self.shape = shape
         self.chunks = chunks
         self.text = text.to(self.device)
         self.text_tokens = text.shape[1]
@@ -256,8 +251,6 @@ class H3DiT:
     def _embedding(self, timestep):
         """H3-native timestep: t=0 is full noise and t=1 is clean."""
         key = float(timestep)
-        if not 0.0 <= key <= 1.0:
-            raise ValueError("H3 timestep must be t=1-sigma in [0, 1]")
         if key not in self.embeddings:
             # Official H3 row timesteps put the prompt at the current window's
             # (noisiest) timestep.  A q=1 Same-Step forward has one video
@@ -349,9 +342,6 @@ class H3DiT:
         pages = len(cache_list[0].history)
         members = len(hidden_list)
         expected = self.hidden_shape(self.shape)
-        if any(not 0.0 <= float(timestep) <= 1.0 for timestep in timestep_list):
-            raise ValueError("H3 timestep must be t=1-sigma in [0, 1]")
-
         batch_size, tokens, width = expected
         temb, indices = self._batch_conditioning(timestep_list, batch_size)
         rotary = self._batch_rotary(chunk_list, pages, batch_size)

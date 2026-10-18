@@ -68,8 +68,6 @@ class Config:
         if self.backend is None:
             raise ValueError(f"unsupported Diffusers transformer: {name}")
         importlib.import_module(f"physisserve.models.{self.backend}").configure(self)
-        if self.ranks > DENOISING_STEPS * self.num_blocks:
-            raise ValueError("pipeline_parallel_size exceeds the number of denoising stages")
         layout.num_ranks(self.num_blocks)
         for component in ("vae", "text_encoder", "tokenizer"):
             if not (root / component).is_dir():

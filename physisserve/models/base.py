@@ -7,7 +7,6 @@
 ``physisserve.models.wan``, ``ltx2`` and ``h3`` implement the family-specific components.
 """
 import json
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,16 +69,6 @@ def drop_attributes(module, names) -> None:
     for name in names:
         if hasattr(module, name):
             delattr(module, name)
-
-
-def block_indices(blocks: Iterable[int], num_blocks: int) -> tuple[int, ...]:
-    """Materialize the exact owned block set, including a noncontiguous one-shot iterable."""
-    blocks = tuple(blocks)
-    if any(type(index) is not int or not 0 <= index < num_blocks for index in blocks):
-        raise ValueError("owned block indices must be integers in [0, num_blocks)")
-    if len(set(blocks)) != len(blocks):
-        raise ValueError("owned block indices must be distinct")
-    return blocks
 
 
 @dataclass(frozen=True)

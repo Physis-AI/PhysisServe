@@ -137,15 +137,6 @@ def test_spawned_mixed_modes_preserve_per_stream_decoder_state(monkeypatch, stra
             assert torch.equal(more[index]["video"], reference["video"])
 
 
-def test_whole_sequence_decoder_rejected_before_model_loading():
-    config = FakeConfig(sequence=True)
-    engine = Engine(config)
-    request = Request("cat", (1, 2, 1, 2, 2), 5, 0, 16, mode="online_decode")
-    with pytest.raises(ValueError, match="whole-sequence.*offline_decode"):
-        engine.prepare([request])
-    assert not config.loaded and not config.encoder_loads and not config.decoder_loads
-
-
 @pytest.mark.parametrize("residual", [False, True], ids=["wan21", "wan22"])
 def test_online_matches_offline_with_real_wan_vae(monkeypatch, tmp_path, residual):
     from diffusers import AutoencoderKLWan

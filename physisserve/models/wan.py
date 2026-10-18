@@ -16,7 +16,7 @@ from torch.nn import functional as F
 
 from ..engine.chunks import Chunks
 from ..engine.kv_cache import BatchCache
-from .base import Backend, block_indices, load_selected_weights
+from .base import Backend, load_selected_weights
 
 
 def configure(config):
@@ -129,13 +129,13 @@ class WanDiT:
         from diffusers import WanTransformer3DModel
 
         self.source = Path(source)
-        if type(cache_text_kv) is not bool:
-            raise ValueError("cache_text_kv must be a boolean")
         self.cache_text_kv = cache_text_kv
         self.config = WanTransformer3DModel.load_config(self.source)
         if self.config["in_channels"] != self.config["out_channels"] or self.config.get("image_dim") is not None:
             raise ValueError("WanDiT supports prompt-only checkpoints with matching input/output channels; "
                              "image-prefix TI2V is not implemented")
+        if self.config["patch_size"][0] != 1:
+            raise ValueError("Wan chunk inference requires temporal patch size 1")
         self.num_blocks = self.config["num_layers"]
         self.model = None
 
@@ -143,7 +143,7 @@ class WanDiT:
         from diffusers import WanTransformer3DModel
         from diffusers.models.transformers.transformer_wan import WanRotaryPosEmbed
 
-        blocks = block_indices(blocks, self.num_blocks)
+        blocks = tuple(blocks)
         cfg = self.config
         with torch.device("meta"):
             model = WanTransformer3DModel.from_config(cfg)
@@ -174,10 +174,8 @@ class WanDiT:
 
     def prepare(self, condition, shape, chunks, fps=None):
         shape = tuple(shape)
-        cfg, b, c, _, h, w = self.config, *shape
-        pt, ph, pw = cfg["patch_size"]
-        if pt != 1 or h % ph or w % pw or c != cfg["in_channels"]:
-            raise ValueError("requires temporal patch 1, patch-aligned spatial size and C == in_channels")
+        cfg, b, _, _, h, w = self.config, *shape
+        _, ph, pw = cfg["patch_size"]
         text = condition.get("text")
         if text is None or text.ndim != 3 or text.shape[0] != b or text.shape[2] != cfg["text_dim"]:
             raise ValueError("condition['text'] must be [B, L, text_dim]")
@@ -195,7 +193,7 @@ class WanDiT:
                 previous = getattr(rope, name)
                 getattr(grown, name)[:previous.shape[0]].copy_(previous)
             self.model.rope = grown
-        self.shape = tuple(shape)
+        self.shape = shape
         self.chunks = chunks
         self.text = text.to(self.device, self.dtype)
         self.embeddings, self.rotary = {}, {}

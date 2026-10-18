@@ -34,8 +34,6 @@ class Engine:
         self.codec_dtype = getattr(torch, config.compute_dtype or config.dtype)
         backend = config.make_backend(config.model)
         self.blocks, self.first_frames = backend.dit.num_blocks, backend.dit.first_frames
-        self.supports_online_decode = (callable(getattr(backend.decoder, "decode", None))
-                                       and not callable(getattr(backend.decoder, "decode_sequence", None)))
         self.sampler = config.make_sampler()
         self.runners = {}
         self.requests, self.sessions, self.rejected = (), (), {}
@@ -67,8 +65,6 @@ class Engine:
         self._check_idle()
         self.prepared = False
         self.requests, self.sessions = tuple(requests), ()
-        if not self.supports_online_decode and any(r.mode == "online_decode" for r in self.requests):
-            raise ValueError("this VAE requires whole-sequence decoding; use offline_decode")
         if placement is None:
             layout = self.config.make_layout()
             layouts = dict.fromkeys(range(len(self.requests)), layout)
@@ -80,8 +76,6 @@ class Engine:
             self.rejected = {int(index): reason for index, reason in placement.rejected.items()}
         plans = {}
         for index, layout in layouts.items():
-            if layout.num_ranks(self.blocks) != self.config.ranks:
-                raise ValueError("each stream layout must cover the configured GPU pool")
             schedules = _request_schedules(layout, self.blocks, self.requests[index].chunks)
             plans[index] = (_request_ticks(schedules, self.blocks),
                             tuple(tuple(layout.rank_blocks(rank, self.blocks))
@@ -92,7 +86,7 @@ class Engine:
         conditions = {}
         if layouts and self.is_output:
             encoder = self.config.make_backend(self.config.model).encoder
-            encoder.load(self.config.encoder_device or self.device, self.codec_dtype)
+            encoder.load(self.config.encoder_device, self.codec_dtype)
             with torch.inference_mode():
                 for index in sorted(layouts):
                     conditions[index] = {key: value.cpu() for key, value in

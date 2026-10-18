@@ -124,7 +124,7 @@ class SequenceDecoder(FakeDecoder):
 
 
 class FakeConfig:
-    device, dtype, compute_dtype, encoder_device, model = "cpu", "float32", None, None, "fake"
+    device, dtype, compute_dtype, encoder_device, model = "cpu", "float32", None, "cpu", "fake"
 
     def __init__(self, strategy="virtual_rank", first_frames=3, sequence=False, ranks=1):
         self.strategy, self.first_frames, self.sequence, self.ranks = strategy, first_frames, sequence, ranks

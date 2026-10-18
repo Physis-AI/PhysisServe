@@ -61,14 +61,9 @@ class PoolPlan:
         if (not isinstance(self.placements, (list, tuple)) or not isinstance(self.rejected, dict)
                 or not isinstance(self.loads, (list, tuple))
                 or any(not isinstance(reason, str) for reason in self.rejected.values())):
-            raise ValueError("placement requires placements, string rejection reasons and RankDemand loads")
+            raise ValueError("placement requires placement/load sequences and string rejection reasons")
         if self.num_ranks != ranks:
             raise ValueError("placement must use the configured GPU pool")
-        for load in self.loads:
-            if (type(load) is not RankDemand or type(load.memory_bytes) is not int or load.memory_bytes < 0
-                    or isinstance(load.utilization, bool) or not isinstance(load.utilization, Real)
-                    or not isfinite(load.utilization) or load.utilization < 0):
-                raise ValueError("loads must contain nonnegative integer memory and finite nonnegative utilization")
         if any(type(item) is not StreamPlacement or not isinstance(item.stream_id, str)
                or not item.stream_id for item in self.placements):
             raise ValueError("placements must contain StreamPlacement objects with nonempty stream IDs")
@@ -77,15 +72,17 @@ class PoolPlan:
                 or set(placed) | set(self.rejected) != {str(index) for index in range(streams)}):
             raise ValueError("placement must cover every input index exactly once")
         for item in self.placements:
-            _validate_candidates((item.candidate,), blocks)
-            if not isinstance(item.rank_map, (list, tuple)) or len(item.rank_map) != len(item.candidate.demands):
+            if type(item.candidate) is not Candidate or type(item.candidate.layout) not in (StageEqual, VirtualRank):
+                raise ValueError("placement requires a Candidate with StageEqual or VirtualRank layout")
+            if (not isinstance(item.rank_map, (list, tuple))
+                    or len(item.rank_map) != item.candidate.layout.num_ranks(blocks)):
                 raise ValueError("rank_map must cover exactly the single-stream local ranks")
             if any(type(rank) is not int or not 0 <= rank < ranks for rank in item.rank_map):
                 raise ValueError("mapped ranks must be integers inside the pool")
 
 
 def _validate_candidates(candidates, blocks):
-    # Shared by the two public boundaries; internal search only handles validated data.
+    # Profiling metadata is consumed by plan_pool, not by execution.
     if not isinstance(candidates, (list, tuple)):
         raise ValueError("candidates must be a list or tuple")
     names = set()

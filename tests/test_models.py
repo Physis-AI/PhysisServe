@@ -62,6 +62,29 @@ def tiny_transformer(family):
         freq_dim=16, time_embed_hidden_dim=64, time_embed_dim=32, rope_freq_dim=4), H3DiT, 24, 32
 
 
+@pytest.mark.parametrize("family", ["wan21_14b", "ltx2", "h3"])
+def test_selective_blocks_materialize_one_shot_ownership(tmp_path, family):
+    model, adapter, _, _ = tiny_transformer(family)
+    model.save_pretrained(tmp_path)
+    dit = adapter(tmp_path)
+    owned = tuple(range(0, dit.num_blocks, 2))
+    dit.load((block for block in owned), "cpu", torch.float32)
+    blocks = dit.model.blocks if family.startswith("wan") else dit.model.transformer_blocks
+    assert tuple(blocks) == tuple(map(str, owned))
+    original = model.state_dict()
+    for name, tensor in dit.model.state_dict().items():
+        torch.testing.assert_close(tensor, original[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("family", ["wan21_1p3b", "ltx2", "h3"])
+def test_unsupported_patch_is_rejected_when_opening_checkpoint(tmp_path, family):
+    model, adapter, _, _ = tiny_transformer(family)
+    model.register_to_config(patch_size=2 if family == "ltx2" else (2, 2, 2))
+    model.save_config(tmp_path)
+    with pytest.raises(ValueError, match="patch size 1"):
+        adapter(tmp_path)
+
+
 @pytest.mark.parametrize("family", ["wan21_1p3b", "wan21_14b", "wan22_5b", "ltx2", "h3"])
 def test_native_batch_preserves_independent_history_and_conditioning(tmp_path, family):
     torch.set_num_threads(1)

@@ -17,7 +17,7 @@ from torch.nn import functional as F
 
 from ..engine.chunks import Chunks
 from ..engine.kv_cache import BatchCache
-from .base import Backend, block_indices, drop_attributes, load_selected_weights
+from .base import Backend, drop_attributes, load_selected_weights
 
 
 def configure(config):
@@ -117,7 +117,7 @@ class LTX2DiT:
         from diffusers import LTX2VideoTransformer3DModel
 
         state_dtype, dtype = dtype, self.compute_dtype or dtype  # dtype: weights and autocast from here on
-        blocks = block_indices(blocks, self.num_blocks)
+        blocks = tuple(blocks)
         with torch.device("meta"):
             model = LTX2VideoTransformer3DModel.from_config(self.config)
         model.transformer_blocks = nn.ModuleDict({str(i): model.transformer_blocks[i] for i in blocks})
@@ -136,10 +136,6 @@ class LTX2DiT:
         self.model = model.eval().requires_grad_(False)
         self.device, self.dtype, self.state_dtype = torch.device(device), dtype, state_dtype
 
-    def _state_dtype(self):
-        """dtype of the engine state (latents, noise, prompt context): load's dtype, else the weights'."""
-        return getattr(self, "state_dtype", None) or self.dtype
-
     @property
     def hidden_dtype(self):
         """dtype of the hidden states between blocks: the compute dtype (autocast), not the engine state's."""
@@ -157,21 +153,15 @@ class LTX2DiT:
         """Prepare the fixed 3-latent head followed by one-latent steady chunks."""
         shape = tuple(shape)
         cfg = self.config
-        b, c = shape[:2]
-        if c != cfg["in_channels"]:
-            raise ValueError("requires C == in_channels")
-        if fps is None:
-            raise ValueError("ltx2 needs the request's fps: its temporal positions depend on the frame rate")
+        b = shape[0]
         self.fps = float(fps)
         text = condition.get("text")
         if text is None or text.ndim != 3 or text.shape[0] != b or text.shape[2] != cfg["cross_attention_dim"]:
             raise ValueError("condition['text'] must be [B, L, cross_attention_dim] (the connectors' video output)")
         rope = self.model.rope
-        if (rope.patch_size_t, rope.patch_size) != (1, 1):
-            raise ValueError("LTX2DiT coordinates support patch size 1 only")
         self.shape = shape
         self.geometry = Chunks(shape, chunks, self.first_frames)
-        self.text = text.to(self.device, self._state_dtype())
+        self.text = text.to(self.device, self.state_dtype)
         # what the transformer's forward makes of an all-ones 2D text mask: an additive zero mask, kept so that
         # cross-attention takes the same kernel path as the reference implementation
         self.text_mask = torch.zeros(b, 1, text.shape[1], device=self.device, dtype=self.dtype)
@@ -208,12 +198,12 @@ class LTX2DiT:
         if key not in self.embeddings:
             with _autocast(self.device, self.dtype):
                 per_token = torch.full((b * tokens,), key[0], device=self.device)
-                temb, embedded = self.model.time_embed(per_token, batch_size=b, hidden_dtype=self._state_dtype())
+                temb, embedded = self.model.time_embed(per_token, batch_size=b, hidden_dtype=self.state_dtype)
                 temb, embedded = temb.view(b, -1, temb.size(-1)), embedded.view(b, -1, embedded.size(-1))
                 prompt = None
                 if self.model.prompt_modulation and self.config.get("use_prompt_adaln_single", True):
                     prompt, _ = self.model.prompt_adaln(torch.full((b,), key[0], device=self.device), batch_size=b,
-                                                        hidden_dtype=self._state_dtype())
+                                                        hidden_dtype=self.state_dtype)
                     prompt = prompt.view(b, -1, prompt.size(-1))
             self.embeddings[key] = temb, embedded, prompt
         return self.embeddings[key]
@@ -221,8 +211,6 @@ class LTX2DiT:
     def _coords(self, positions):
         """RoPE coordinates of the given latent frames of a clip that starts at frame 0 (frame, height, width)."""
         positions = tuple(positions)
-        if not positions or any(type(frame) is not int or frame < 0 for frame in positions):
-            raise ValueError("LTX frame positions must be nonempty nonnegative integers")
         if all(right == left + 1 for left, right in zip(positions, positions[1:])):
             frames = torch.arange(positions[0], positions[-1] + 1, device=self.device,
                                   dtype=torch.int64).to(torch.float32)
@@ -281,9 +269,6 @@ class LTX2DiT:
         Request preparation clears this cache; native singleton tables stay separate.
         """
         chunks = tuple(chunks)
-        if (not chunks or type(history) is not int or history < 0
-                or any(type(chunk) is not int or not history <= chunk < self.chunks for chunk in chunks)):
-            raise ValueError("chunks must be in the prepared request and have the stated history")
         batch = self.shape[0]
         key = chunks, history, batch
         old = self._batch_rotary_cache

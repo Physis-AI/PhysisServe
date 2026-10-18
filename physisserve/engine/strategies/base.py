@@ -62,9 +62,6 @@ class BatchSchedule(Schedule):
 
 
 class _StaticPlacement:
-    def _stage_owners(self, blocks: int) -> tuple[int, ...]:
-        raise NotImplementedError
-
     def num_ranks(self, blocks: int) -> int:
         return max(self._stage_owners(blocks)) + 1
 
