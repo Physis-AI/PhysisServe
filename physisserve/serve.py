@@ -126,22 +126,30 @@ class PhysisServe:
             raise ValueError("provide one SamplingParams or one per prompt")
         return [param.request(prompt, self.config) for prompt, param in zip(prompts, params)]
 
-    def generate(self, prompts, sampling_params=None, *, output_type="video", placement=None):
-        """Return ordered results with ``video`` (uint8 THWC), or just ``latents``.
+    def generate(self, prompts, sampling_params=None, *, placement=None):
+        """Return ordered CPU latents and, for decoding modes, uint8 THWC videos.
 
         Every prompt has its own KV cache and seed. ``placement`` optionally accepts
         a measured resource plan from ``physisserve.engine.strategies.placement``.
+        ``SamplingParams.mode`` selects DiT only, decoding after all streams finish,
+        or decoding completed chunks during denoising.
         """
-        if output_type not in ("video", "latent"):
-            raise ValueError("output_type must be video or latent")
         requests = self._requests(prompts, sampling_params)
         if not requests:
             return []
-        if output_type == "video" and self.config.backend == "h3" and any(r.chunks < 3 for r in requests):
+        if self.config.backend in ("h3", "ltx2") and any(r.mode == "stream_decode" for r in requests):
+            raise ValueError(f"{self.config.backend} uses a whole-sequence VAE; stream_decode is unsupported")
+        if self.config.backend == "h3" and any(r.mode != "dit_only" and r.chunks < 3 for r in requests):
             raise ValueError("H3 video decoding requires at least 3 chunks")
         self._call("prepare", requests, placement=placement)
         outputs = self._call("run")[0]
-        return self.decode(outputs) if output_type == "video" else outputs
+        deferred = [index for index, request in enumerate(requests)
+                    if request.mode == "deferred_decode" and outputs[index].get("status") != "rejected"]
+        if deferred:
+            decoded = self.decode([outputs[index] for index in deferred])
+            for index, output in zip(deferred, decoded):
+                outputs[index] = output
+        return outputs
 
     def decode(self, outputs):
         """Decode previously generated latents after inference or benchmarking."""

@@ -105,7 +105,8 @@ def main():
     print(f"VirtualRank costs: {args.batch_costs}" if args.batch_costs else
           "VirtualRank costs: unprofiled equal-block batch weights")
     prompts = [args.prompt] * args.streams
-    params = [SamplingParams(num_chunks=args.chunks, height=args.height, width=args.width, seed=args.seed + index)
+    params = [SamplingParams(num_chunks=args.chunks, height=args.height, width=args.width,
+                             seed=args.seed + index, mode="dit_only")
               for index in range(args.streams)]
     reports = {}
     for strategy in ("stage_equal", "virtual_rank"):

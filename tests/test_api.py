@@ -28,6 +28,7 @@ def test_standard_diffusers_profiles(tmp_path, name, channels, blocks, backend, 
     request = SamplingParams().request("cat", config)
     assert config.backend == backend and config.num_blocks == blocks
     assert request.shape == shape and request.chunks == chunks and request.fps == fps
+    assert request.mode == "deferred_decode" and request.latent_dir is None
     assert len(config.make_sampler().sigmas) == 5 and config.make_sampler().sigmas[-1] == 0
     if backend == "ltx2":
         assert config.dtype == "float32" and config.compute_dtype == "bfloat16"
@@ -52,16 +53,16 @@ def fake_config(model, *, ranks=1, strategy="virtual_rank", **kwargs):
 def test_public_generate_unifies_single_multiple_and_deferred_video(monkeypatch, ranks):
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
     with PhysisServe("fake", device="cpu", pipeline_parallel_size=ranks) as model:
-        params = SamplingParams(num_chunks=5, seed=17)
-        single = model.generate("cat", params, output_type="latent")
+        params = SamplingParams(num_chunks=5, seed=17, mode="dit_only")
+        single = model.generate("cat", params)
         assert len(single) == 1 and "video" not in single[0]
-        multiple = model.generate(["cat", "dog"], params, output_type="latent")
+        multiple = model.generate(["cat", "dog"], params)
         assert [output["prompt"] for output in multiple] == ["cat", "dog"]
         torch.testing.assert_close(single[0]["latents"], multiple[0]["latents"], rtol=0, atol=0)
         decoded = model.decode(multiple)
         assert [output["video"].shape for output in decoded] == [(13, 2, 2, 3)] * 2
         assert all(output["video"].dtype == torch.uint8 for output in decoded)
-        again = model.generate("dog", params)
+        again = model.generate("dog", SamplingParams(num_chunks=5, seed=17))
         torch.testing.assert_close(again[0]["video"], decoded[1]["video"], rtol=0, atol=0)
         assert model.generate([], params) == []
         with pytest.raises(ValueError, match="one per prompt"):
@@ -86,10 +87,93 @@ def test_worker_failure_is_reported_and_processes_are_reaped(monkeypatch):
         assert model._closed and not any(process.is_alive() for process in processes)
 
 
-@pytest.mark.parametrize("kwargs", [{"num_chunks": 0}, {"height": -1}, {"seed": -1}, {"fps": True}])
+@pytest.mark.parametrize("kwargs", [
+    {"num_chunks": 0}, {"height": -1}, {"seed": -1}, {"fps": True},
+    {"mode": "video"}, {"mode": None}, {"mode": []},
+    {"latent_dir": ""}, {"latent_dir": "  "}, {"latent_dir": 3},
+])
 def test_invalid_sampling_inputs(kwargs):
     with pytest.raises(ValueError):
         SamplingParams(**kwargs)
+
+
+@pytest.mark.parametrize("mode", ["dit_only", "deferred_decode", "stream_decode"])
+def test_sampling_mode_and_latent_directory_reach_request(tmp_path, mode):
+    target = tmp_path / "latents"
+    params = SamplingParams(mode=mode, latent_dir=str(target))
+    request = params.request("cat", fake_config("fake"))
+    assert request.mode == mode and request.latent_dir == target
+    assert not target.exists()
+    assert Request("cat", (1, 2, 1, 2, 2), 5, 0, 16).mode == "dit_only"
+
+
+def test_latent_directory_rejects_file(tmp_path):
+    path = tmp_path / "file"
+    path.write_text("data")
+    with pytest.raises(ValueError, match="directory"):
+        SamplingParams(latent_dir=path)
+
+
+def test_mixed_modes_decode_after_all_streams_and_preserve_order_and_rejections():
+    model = PhysisServe.__new__(PhysisServe)
+    model.config = fake_config("fake")
+    events = []
+    outputs = [{"prompt": prompt, "latents": index}
+               for index, prompt in enumerate(("raw", "deferred", "stream", "rejected", "deferred2"))]
+    outputs[2]["video"] = "streamed video"
+    outputs[3] = {"prompt": "rejected", "status": "rejected", "reason": "capacity"}
+
+    def call(operation, *args, **kwargs):
+        events.append(operation)
+        if operation == "prepare":
+            assert [request.mode for request in args[0]] == [
+                "dit_only", "deferred_decode", "stream_decode", "deferred_decode", "deferred_decode"]
+            return [None]
+        if operation == "run":
+            return [outputs]
+        assert operation == "decode" and events == ["prepare", "run", "decode"]
+        assert [output["prompt"] for output in args[0]] == ["deferred", "deferred2"]
+        return [[{**output, "video": "decoded video"} for output in args[0]]]
+
+    model._call = call
+    result = model.generate([output["prompt"] for output in outputs], [
+        SamplingParams(mode=mode) for mode in
+        ("dit_only", "deferred_decode", "stream_decode", "deferred_decode", "deferred_decode")])
+    assert events == ["prepare", "run", "decode"]
+    assert [output["prompt"] for output in result] == ["raw", "deferred", "stream", "rejected", "deferred2"]
+    assert "video" not in result[0] and "video" not in result[3]
+    assert result[1]["video"] == result[4]["video"] == "decoded video"
+    assert result[2]["video"] == "streamed video"
+    assert result[3] == {"prompt": "rejected", "status": "rejected", "reason": "capacity"}
+
+
+@pytest.mark.parametrize("backend", ["h3", "ltx2"])
+def test_whole_sequence_vae_rejects_stream_mode_before_worker_call(backend):
+    model = PhysisServe.__new__(PhysisServe)
+    model.config = fake_config("fake")
+    model.config.backend = backend
+    model._call = lambda *args, **kwargs: pytest.fail("unsupported mode must fail before worker calls")
+    with pytest.raises(ValueError, match="whole-sequence VAE.*stream_decode"):
+        model.generate(["cat", "dog"], [SamplingParams(), SamplingParams(mode="stream_decode")])
+
+
+def test_h3_short_chunks_allowed_only_for_dit_mode():
+    model = PhysisServe.__new__(PhysisServe)
+    model.config = fake_config("fake")
+    model.config.backend = "h3"
+    calls = []
+
+    def call(operation, *args, **kwargs):
+        calls.append(operation)
+        return [[{"prompt": "cat", "latents": "raw"}]] if operation == "run" else [None]
+
+    model._call = call
+    assert model.generate("cat", SamplingParams(num_chunks=1, mode="dit_only"))[0]["latents"] == "raw"
+    assert calls == ["prepare", "run"]
+    calls.clear()
+    with pytest.raises(ValueError, match="at least 3 chunks"):
+        model.generate("cat", SamplingParams(num_chunks=1))
+    assert calls == []
 
 
 def test_request_rejects_batched_or_multi_latent_input():
@@ -97,6 +181,8 @@ def test_request_rejects_batched_or_multi_latent_input():
         Request("cat", (1, 16, 3, 60, 104), 5, 0, 16)
     with pytest.raises(ValueError, match="shape"):
         Request("cat", (2, 16, 1, 60, 104), 5, 0, 16)
+    with pytest.raises(ValueError, match="mode"):
+        Request("cat", (1, 16, 1, 60, 104), 5, 0, 16, mode="video")
 
 
 def test_complete_diffusers_model_generates_decodable_video(tmp_path):

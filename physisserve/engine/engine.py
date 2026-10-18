@@ -1,5 +1,7 @@
 """Single and concurrent video streams share the same tick-by-tick execution."""
 from datetime import timedelta
+from pathlib import Path
+from tempfile import mkdtemp
 
 import torch
 import torch.distributed as dist
@@ -32,6 +34,8 @@ class Engine:
         self.codec_dtype = getattr(torch, config.compute_dtype or config.dtype)
         backend = config.make_backend(config.model)
         self.blocks, self.first_frames = backend.dit.num_blocks, backend.dit.first_frames
+        self.supports_stream_decode = (callable(getattr(backend.decoder, "decode", None))
+                                       and not callable(getattr(backend.decoder, "decode_sequence", None)))
         self.sampler = config.make_sampler()
         self.runners = {}
         self.requests, self.sessions, self.rejected = (), (), {}
@@ -65,6 +69,8 @@ class Engine:
         self.requests, self.sessions = tuple(requests), ()
         if any(not isinstance(request, Request) for request in self.requests):
             raise TypeError("requests must contain Request objects")
+        if not self.supports_stream_decode and any(r.mode == "stream_decode" for r in self.requests):
+            raise ValueError("this VAE requires whole-sequence decoding; use deferred_decode")
         ids = {str(index) for index in range(len(self.requests))}
         if placement is None:
             layout = self.config.make_layout()
@@ -124,8 +130,9 @@ class Engine:
         """Interleave one tick per active stream; return CPU latents on rank zero.
 
         Callbacks receive the input index followed by the runner's chunk/latent or
-        rank/batch-size values. Outputs remain on the device until every stream has
-        completed, so host transfers and VAE decoding are outside model execution.
+        rank/batch-size values. dit_only retains outputs on the device until all
+        streams finish. Other modes buffer completed latents in CPU memory;
+        stream_decode additionally decodes each chunk before advancing this rank.
         Calling run again reuses weights and starts fresh KV state and seeded noise.
         """
         self._check_idle()
@@ -134,10 +141,16 @@ class Engine:
         self.busy = True
         active, iterators = [], []
         chunks = {index: [] for index, *_ in self.sessions}
+        decoders, videos = {}, {}
         completed = False
         try:
             for index, ticks, runner, condition in self.sessions:
                 request = self.requests[index]
+                if self.is_output and request.mode == "stream_decode":
+                    decoder = self.config.make_backend(self.config.model).decoder
+                    decoder.load(self.device, self.codec_dtype)
+                    decoder.reset()
+                    decoders[index], videos[index] = decoder, []
                 latent_cb = (None if on_latent is None else
                              lambda chunk, value, index=index: on_latent(index, chunk, value))
                 batch_cb = (None if on_batch is None else
@@ -154,7 +167,22 @@ class Engine:
                         outputs = next(iterator)
                     except StopIteration as error:
                         raise RuntimeError("runner ended before its scheduled final tick") from error
-                    chunks[index].extend(outputs)
+                    for chunk, latent in outputs:
+                        request = self.requests[index]
+                        shape = (*request.shape[:2], self.first_frames if chunk == 0 else 1, *request.shape[3:])
+                        if tuple(latent.shape) != shape:
+                            raise RuntimeError(f"stream {index} chunk {chunk} has incorrect latent shape")
+                        if index in decoders:
+                            if chunk != len(chunks[index]):
+                                raise RuntimeError(f"stream {index} returned missing or duplicate chunks")
+                            decoder = decoders[index]
+                            with torch.inference_mode():
+                                pixels = decoder.decode(latent.to(device=self.device, dtype=self.codec_dtype), chunk)
+                                self._check_pixels(pixels, decoder.frames(chunk, shape))
+                            videos[index].append(self._video(pixels))
+                        if request.mode != "dit_only":
+                            latent = latent.cpu()
+                        chunks[index].append((chunk, latent))
                     session[1] -= 1
                     if remaining == 1:
                         try:
@@ -176,18 +204,18 @@ class Engine:
                     outputs = sorted(chunks[index], key=lambda item: item[0])
                     if [chunk for chunk, _ in outputs] != list(range(request.chunks)):
                         raise RuntimeError(f"stream {index} returned missing or duplicate chunks")
-                    for chunk, latent in outputs:
-                        shape = list(request.shape)
-                        shape[2] = self.first_frames if chunk == 0 else 1
-                        if tuple(latent.shape) != tuple(shape):
-                            raise RuntimeError(f"stream {index} chunk {chunk} has incorrect latent shape")
                     result.update(latents=torch.cat([latent for _, latent in outputs], dim=2).cpu(),
                                   chunks=request.chunks, first_frames=self.first_frames)
+                    if index in videos:
+                        result["video"] = torch.cat(videos[index], dim=0)
+                    if request.latent_dir is not None:
+                        self._save_latents(result, request.latent_dir, index)
                 results.append(result)
             return results
         finally:
             for iterator in iterators:
                 iterator.close()
+            decoders.clear()
             self.busy = False
             if self.distributed and not completed:
                 self.failed = True
@@ -235,9 +263,24 @@ class Engine:
                         decoded.append(pixels)
                     pixels = torch.cat(decoded, dim=2)
                 self._check_pixels(pixels, sum(frame_counts))
-                video = ((pixels[0].float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
-            results.append({**output, "video": video.permute(1, 2, 3, 0).cpu().contiguous().clone()})
+            results.append({**output, "video": self._video(pixels)})
         return results
+
+    @staticmethod
+    def _video(pixels):
+        video = ((pixels[0].float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
+        return video.permute(1, 2, 3, 0).cpu().contiguous().clone()
+
+    @staticmethod
+    def _save_latents(output, directory, index):
+        from safetensors.torch import save_file
+
+        root = Path(directory).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        path = Path(mkdtemp(prefix=f"stream-{index:04d}-", dir=root)) / "latents.safetensors"
+        metadata = {key: str(output[key]) for key in ("prompt", "fps", "chunks", "first_frames")}
+        save_file({"latents": output["latents"]}, str(path), metadata=metadata)
+        output["latent_path"] = str(path)
 
     @staticmethod
     def _check_pixels(pixels, frames):
