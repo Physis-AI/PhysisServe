@@ -13,7 +13,7 @@ def main():
     parser.add_argument("--chunks", type=int, default=None)
     parser.add_argument("--mode", choices=("dit_only", "deferred_decode", "stream_decode"),
                         default="deferred_decode")
-    parser.add_argument("--latent-dir", help="optionally save denoised latents in this directory")
+    parser.add_argument("--latent-dir", help="latent output root (default: ./latents for deferred_decode)")
     args = parser.parse_args()
 
     with PhysisServe(args.model, pipeline_parallel_size=args.gpus) as model:
@@ -23,9 +23,10 @@ def main():
             if output.get("status") == "rejected":
                 print(f"stream {index} rejected: {output['reason']}")
                 continue
+            if "latent_path" in output:
+                print(f"stream {index}: latents saved to {output['latent_path']}")
             if "video" not in output:
-                print(f"stream {index}: latents {tuple(output['latents'].shape)}"
-                      + (f", saved to {output['latent_path']}" if "latent_path" in output else ""))
+                print(f"stream {index}: latents {tuple(output['latents'].shape)}")
                 continue
             iio.imwrite(f"video-{index}.mp4", output["video"].numpy(), fps=output["fps"],
                         codec="libx264", pixelformat="yuv420p", macro_block_size=None,

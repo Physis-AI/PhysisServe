@@ -195,7 +195,7 @@ class Engine:
             completed = True
             if not self.is_output:
                 return None
-            results = []
+            results, directories = [], {}
             for index, request in enumerate(self.requests):
                 result = {"prompt": request.prompt, "fps": request.fps}
                 if index in self.rejected:
@@ -208,8 +208,12 @@ class Engine:
                                   chunks=request.chunks, first_frames=self.first_frames)
                     if index in videos:
                         result["video"] = torch.cat(videos[index], dim=0)
-                    if request.latent_dir is not None:
-                        self._save_latents(result, request.latent_dir, index)
+                    if request.latent_dir is not None or request.mode == "deferred_decode":
+                        root = Path(request.latent_dir or "latents").expanduser().resolve()
+                        if root not in directories:
+                            root.mkdir(parents=True, exist_ok=True)
+                            directories[root] = Path(mkdtemp(prefix="generate-", dir=root))
+                        self._save_latents(result, directories[root], index)
                 results.append(result)
             return results
         finally:
@@ -275,9 +279,7 @@ class Engine:
     def _save_latents(output, directory, index):
         from safetensors.torch import save_file
 
-        root = Path(directory).expanduser().resolve()
-        root.mkdir(parents=True, exist_ok=True)
-        path = Path(mkdtemp(prefix=f"stream-{index:04d}-", dir=root)) / "latents.safetensors"
+        path = directory / f"stream-{index:04d}.safetensors"
         metadata = {key: str(output[key]) for key in ("prompt", "fps", "chunks", "first_frames")}
         save_file({"latents": output["latents"]}, str(path), metadata=metadata)
         output["latent_path"] = str(path)

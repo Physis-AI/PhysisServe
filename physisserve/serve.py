@@ -132,7 +132,8 @@ class PhysisServe:
         Every prompt has its own KV cache and seed. ``placement`` optionally accepts
         a measured resource plan from ``physisserve.engine.strategies.placement``.
         ``SamplingParams.mode`` selects DiT only, decoding after all streams finish,
-        or decoding completed chunks during denoising.
+        or decoding completed chunks during denoising. Deferred decoding first
+        saves each stream's latents to disk; ``latent_path`` identifies the file.
         """
         requests = self._requests(prompts, sampling_params)
         if not requests:

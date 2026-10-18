@@ -7,7 +7,9 @@ class SamplingParams:
     """``dit_only`` returns latents; ``deferred_decode`` decodes after all streams.
 
     ``stream_decode`` decodes each completed chunk while denoising continues.
-    ``latent_dir`` optionally persists the denoised latents in any mode.
+    ``deferred_decode`` saves latents under ``latent_dir`` (default: ./latents)
+    before decoding. Each generation gets a separate subdirectory. Other modes
+    save latents only when ``latent_dir`` is specified.
     """
 
     num_chunks: int | None = None

@@ -15,7 +15,8 @@ from tests.test_engine import FakeConfig, FakeDecoder, FakeDiT
 
 
 @pytest.mark.parametrize("mode", ["dit_only", "deferred_decode", "stream_decode"])
-def test_decode_happens_at_the_selected_time_and_preserves_latents(monkeypatch, mode):
+def test_decode_happens_at_the_selected_time_and_preserves_latents(monkeypatch, tmp_path, mode):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
     events = []
     unembed, decode = FakeDiT.unembed, FakeDecoder.decode
@@ -33,9 +34,17 @@ def test_decode_happens_at_the_selected_time_and_preserves_latents(monkeypatch, 
     with PhysisServe("fake", device="cpu") as model:
         params = SamplingParams(num_chunks=8, seed=17, mode="dit_only")
         raw = model.generate("cat", params)[0]
+        assert "latent_path" not in raw and not (tmp_path / "latents").exists()
         events.clear()
         output = model.generate("cat", replace(params, mode=mode))[0]
         torch.testing.assert_close(output["latents"], raw["latents"], rtol=0, atol=0)
+        if mode == "deferred_decode":
+            path = Path(output["latent_path"])
+            assert path.is_file() and path.name == "stream-0000.safetensors"
+            assert path.parent.name.startswith("generate-")
+            assert path.parent.parent == tmp_path / "latents"
+        else:
+            assert "latent_path" not in output and not (tmp_path / "latents").exists()
         if mode == "dit_only":
             assert all(kind == "dit" for kind, _ in events)
             assert "video" not in output and model._engine.config.decoder_loads == 0
@@ -49,31 +58,62 @@ def test_decode_happens_at_the_selected_time_and_preserves_latents(monkeypatch, 
             assert not torch.is_inference(output["video"])
 
 
-def test_latents_are_saved_before_deferred_decode_without_overwriting(monkeypatch, tmp_path):
+@pytest.mark.parametrize("explicit_directory", [False, True], ids=["default", "explicit"])
+def test_latents_are_saved_before_deferred_decode_without_overwriting(monkeypatch, tmp_path, explicit_directory):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
+    root = tmp_path / ("saved" if explicit_directory else "latents")
     load = FakeDecoder.load
     saved = []
 
     def check_saved(self, device, dtype):
-        paths = sorted(tmp_path.glob("stream-*/latents.safetensors"))
+        paths = sorted(root.glob("generate-*/stream-*.safetensors"))
         assert len(paths) == len(saved) + 2  # both streams persisted before the VAE loads
         saved[:] = paths
         load(self, device, dtype)
 
     monkeypatch.setattr(FakeDecoder, "load", check_saved)
     with PhysisServe("fake", device="cpu") as model:
-        params = SamplingParams(num_chunks=4, mode="deferred_decode", latent_dir=tmp_path)
+        params = SamplingParams(num_chunks=4, mode="deferred_decode", latent_dir=root if explicit_directory else None)
         first = model.generate(["cat", "dog"], params)
         again = model.generate(["cat", "dog"], params)
     assert len(saved) == 4
+    first_directory = {Path(output["latent_path"]).parent for output in first}
+    again_directory = {Path(output["latent_path"]).parent for output in again}
+    assert len(first_directory) == len(again_directory) == 1
+    assert first_directory.isdisjoint(again_directory)
+    assert len(list(root.iterdir())) == 2
+    for directory in first_directory | again_directory:
+        assert directory.name.startswith("generate-")
+        assert {path.name for path in directory.iterdir()} == {"stream-0000.safetensors", "stream-0001.safetensors"}
     assert {output["latent_path"] for output in first}.isdisjoint(output["latent_path"] for output in again)
     for output in first + again:
         path = Path(output["latent_path"])
-        assert path.is_absolute() and path.is_relative_to(tmp_path)
+        assert path.is_absolute() and path.parent.parent == root
         torch.testing.assert_close(load_file(path)["latents"], output["latents"], rtol=0, atol=0)
         with safe_open(path, framework="pt") as file:
             assert file.metadata()["prompt"] == output["prompt"]
             assert file.metadata()["first_frames"] == "3"
+
+
+def test_explicit_latent_directories_save_all_modes_and_group_by_resolved_root(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("physisserve.serve.Config", fake_config)
+    first_root, second_root = tmp_path / "first", tmp_path / "second"
+    params = [SamplingParams(num_chunks=4, mode="dit_only", latent_dir=first_root),
+              SamplingParams(num_chunks=4, mode="stream_decode", latent_dir=Path("first")),
+              SamplingParams(num_chunks=4, mode="deferred_decode", latent_dir=second_root)]
+    with PhysisServe("fake", device="cpu") as model:
+        outputs = model.generate(["cat", "dog", "beach"], params)
+    paths = [Path(output["latent_path"]) for output in outputs]
+    assert paths[0].parent == paths[1].parent
+    assert paths[0].parent.parent == first_root
+    assert paths[2].parent.parent == second_root
+    assert paths[0].parent != paths[2].parent
+    assert not (tmp_path / "latents").exists()
+    for index, (path, output) in enumerate(zip(paths, outputs)):
+        assert path.name == f"stream-{index:04d}.safetensors"
+        torch.testing.assert_close(load_file(path)["latents"], output["latents"], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("strategy", ["stage_equal", "virtual_rank"])
