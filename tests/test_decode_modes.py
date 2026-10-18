@@ -14,7 +14,7 @@ from tests.test_api import fake_config
 from tests.test_engine import FakeConfig, FakeDecoder, FakeDiT
 
 
-@pytest.mark.parametrize("mode", ["dit_only", "deferred_decode", "stream_decode"])
+@pytest.mark.parametrize("mode", ["dit_only", "offline_decode", "online_decode"])
 def test_decode_happens_at_the_selected_time_and_preserves_latents(monkeypatch, tmp_path, mode):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
@@ -38,7 +38,7 @@ def test_decode_happens_at_the_selected_time_and_preserves_latents(monkeypatch, 
         events.clear()
         output = model.generate("cat", replace(params, mode=mode))[0]
         torch.testing.assert_close(output["latents"], raw["latents"], rtol=0, atol=0)
-        if mode == "deferred_decode":
+        if mode == "offline_decode":
             path = Path(output["latent_path"])
             assert path.is_file() and path.name == "stream-0000.safetensors"
             assert path.parent.name.startswith("generate-")
@@ -51,7 +51,7 @@ def test_decode_happens_at_the_selected_time_and_preserves_latents(monkeypatch, 
         else:
             first_decode = next(index for index, event in enumerate(events) if event[0] == "vae")
             last_dit = max(index for index, event in enumerate(events) if event[0] == "dit")
-            assert (first_decode > last_dit) == (mode == "deferred_decode")
+            assert (first_decode > last_dit) == (mode == "offline_decode")
             assert [chunk for kind, chunk in events if kind == "vae"] == list(range(8))
             expected = model.decode([raw])[0]["video"]
             assert torch.equal(output["video"], expected)
@@ -59,7 +59,7 @@ def test_decode_happens_at_the_selected_time_and_preserves_latents(monkeypatch, 
 
 
 @pytest.mark.parametrize("explicit_directory", [False, True], ids=["default", "explicit"])
-def test_latents_are_saved_before_deferred_decode_without_overwriting(monkeypatch, tmp_path, explicit_directory):
+def test_latents_are_saved_before_offline_decode_without_overwriting(monkeypatch, tmp_path, explicit_directory):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
     root = tmp_path / ("saved" if explicit_directory else "latents")
@@ -74,7 +74,7 @@ def test_latents_are_saved_before_deferred_decode_without_overwriting(monkeypatc
 
     monkeypatch.setattr(FakeDecoder, "load", check_saved)
     with PhysisServe("fake", device="cpu") as model:
-        params = SamplingParams(num_chunks=4, mode="deferred_decode", latent_dir=root if explicit_directory else None)
+        params = SamplingParams(num_chunks=4, mode="offline_decode", latent_dir=root if explicit_directory else None)
         first = model.generate(["cat", "dog"], params)
         again = model.generate(["cat", "dog"], params)
     assert len(saved) == 4
@@ -101,8 +101,8 @@ def test_explicit_latent_directories_save_all_modes_and_group_by_resolved_root(m
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
     first_root, second_root = tmp_path / "first", tmp_path / "second"
     params = [SamplingParams(num_chunks=4, mode="dit_only", latent_dir=first_root),
-              SamplingParams(num_chunks=4, mode="stream_decode", latent_dir=Path("first")),
-              SamplingParams(num_chunks=4, mode="deferred_decode", latent_dir=second_root)]
+              SamplingParams(num_chunks=4, mode="online_decode", latent_dir=Path("first")),
+              SamplingParams(num_chunks=4, mode="offline_decode", latent_dir=second_root)]
     with PhysisServe("fake", device="cpu") as model:
         outputs = model.generate(["cat", "dog", "beach"], params)
     paths = [Path(output["latent_path"]) for output in outputs]
@@ -120,15 +120,15 @@ def test_explicit_latent_directories_save_all_modes_and_group_by_resolved_root(m
 def test_spawned_mixed_modes_preserve_per_stream_decoder_state(monkeypatch, strategy):
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
     prompts = ["cat", "dog", "beach"]
-    params = [SamplingParams(num_chunks=6, seed=11, mode="stream_decode"),
-              SamplingParams(num_chunks=4, seed=12, mode="deferred_decode"),
+    params = [SamplingParams(num_chunks=6, seed=11, mode="online_decode"),
+              SamplingParams(num_chunks=4, seed=12, mode="offline_decode"),
               SamplingParams(num_chunks=5, seed=13, mode="dit_only")]
     with PhysisServe("fake", device="cpu", pipeline_parallel_size=2, strategy=strategy) as model:
         outputs = model.generate(prompts, params)
         assert ["video" in output for output in outputs] == [True, True, False]
-        more = model.generate(prompts[:2], [replace(param, mode="stream_decode") for param in params[:2]])
+        more = model.generate(prompts[:2], [replace(param, mode="online_decode") for param in params[:2]])
     with PhysisServe("fake", device="cpu", strategy=strategy) as model:
-        expected = [model.generate(prompt, replace(param, mode="deferred_decode"))[0]
+        expected = [model.generate(prompt, replace(param, mode="offline_decode"))[0]
                     for prompt, param in zip(prompts, params)]
     for index, (output, reference) in enumerate(zip(outputs, expected)):
         torch.testing.assert_close(output["latents"], reference["latents"], rtol=0, atol=0)
@@ -140,14 +140,14 @@ def test_spawned_mixed_modes_preserve_per_stream_decoder_state(monkeypatch, stra
 def test_whole_sequence_decoder_rejected_before_model_loading():
     config = FakeConfig(sequence=True)
     engine = Engine(config)
-    request = Request("cat", (1, 2, 1, 2, 2), 5, 0, 16, mode="stream_decode")
-    with pytest.raises(ValueError, match="whole-sequence.*deferred_decode"):
+    request = Request("cat", (1, 2, 1, 2, 2), 5, 0, 16, mode="online_decode")
+    with pytest.raises(ValueError, match="whole-sequence.*offline_decode"):
         engine.prepare([request])
     assert not config.loaded and not config.encoder_loads and not config.decoder_loads
 
 
 @pytest.mark.parametrize("residual", [False, True], ids=["wan21", "wan22"])
-def test_streaming_matches_deferred_with_real_wan_vae(monkeypatch, tmp_path, residual):
+def test_online_matches_offline_with_real_wan_vae(monkeypatch, tmp_path, residual):
     from diffusers import AutoencoderKLWan
 
     torch.set_num_threads(1)
@@ -166,14 +166,14 @@ def test_streaming_matches_deferred_with_real_wan_vae(monkeypatch, tmp_path, res
 
     monkeypatch.setattr(config, "make_backend", with_real_vae)
     engine = Engine(config)
-    requests = [Request(prompt, (1, 4, 1, 2, 2), 4, seed, 16, mode="stream_decode")
+    requests = [Request(prompt, (1, 4, 1, 2, 2), 4, seed, 16, mode="online_decode")
                 for seed, prompt in enumerate(["cat", "dog"])]
     engine.prepare(requests)
-    streaming = engine.run()
-    engine.prepare([replace(request, mode="deferred_decode") for request in requests])
+    online = engine.run()
+    engine.prepare([replace(request, mode="offline_decode") for request in requests])
     latents = engine.run()
     assert all("video" not in output for output in latents)
-    deferred = engine.decode(latents)
-    for actual, expected in zip(streaming, deferred):
+    offline = engine.decode(latents)
+    for actual, expected in zip(online, offline):
         torch.testing.assert_close(actual["latents"], expected["latents"], rtol=0, atol=0)
         torch.testing.assert_close(actual["video"], expected["video"], rtol=0, atol=0)

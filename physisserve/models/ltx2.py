@@ -26,7 +26,7 @@ def configure(config):
     config.patch_size = (1, 1, 1)
     config.sigmas = (1.0, 0.8920687437057495, 0.6825016736984253, 0.10000002384185791, 0.0)
     config.timesteps = tuple(1000.0 * value for value in config.sigmas[:-1])
-    config.supports_stream_decode = False
+    config.supports_online_decode = False
 
 
 def backend(root) -> Backend:

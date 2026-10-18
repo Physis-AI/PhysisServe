@@ -5,7 +5,7 @@ from physisserve import PhysisServe, SamplingParams
 
 def main():
     model = PhysisServe("Physis-AI/physisserve-wan2p1_1p3b-same_step-sdv2", pipeline_parallel_size=1)
-    sampling_params = SamplingParams(mode="deferred_decode")
+    sampling_params = SamplingParams(mode="offline_decode")
     prompts = [
         "A corgi running along the beach at sunset.",
         "A paper boat floating down a quiet forest stream.",

@@ -131,23 +131,23 @@ class PhysisServe:
         Every prompt has its own KV cache and seed. ``placement`` optionally accepts
         a measured resource plan from ``physisserve.engine.strategies.placement``.
         ``SamplingParams.mode`` selects DiT only, decoding after all streams finish,
-        or decoding completed chunks during denoising. Deferred decoding first
+        or decoding completed chunks during denoising. Offline decoding first
         saves each stream's latents to disk; ``latent_path`` identifies the file.
         """
         requests = self._requests(prompts, sampling_params)
         if not requests:
             return []
-        if not self.config.supports_stream_decode and any(r.mode == "stream_decode" for r in requests):
-            raise ValueError(f"{self.config.backend} uses a whole-sequence VAE; stream_decode is unsupported")
+        if not self.config.supports_online_decode and any(r.mode == "online_decode" for r in requests):
+            raise ValueError(f"{self.config.backend} uses a whole-sequence VAE; online_decode is unsupported")
         if any(r.mode != "dit_only" and r.chunks < self.config.min_decode_chunks for r in requests):
             raise ValueError(f"{self.config.backend} video decoding requires at least {self.config.min_decode_chunks} chunks")
         self._call("prepare", requests, placement=placement)
         outputs = self._call("run")[0]
-        deferred = [index for index, request in enumerate(requests)
-                    if request.mode == "deferred_decode" and outputs[index].get("status") != "rejected"]
-        if deferred:
-            decoded = self.decode([outputs[index] for index in deferred])
-            for index, output in zip(deferred, decoded):
+        offline = [index for index, request in enumerate(requests)
+                   if request.mode == "offline_decode" and outputs[index].get("status") != "rejected"]
+        if offline:
+            decoded = self.decode([outputs[index] for index in offline])
+            for index, output in zip(offline, decoded):
                 outputs[index] = output
         return outputs
 

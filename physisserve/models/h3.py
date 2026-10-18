@@ -25,7 +25,7 @@ def configure(config):
     config.height, config.width, config.spatial_scale, config.chunks, config.fps = 768, 1344, 16, 48, 24
     config.sigmas = (1.0, 0.9097071290016174, 0.7173174619674683, 0.0244140625, 0.0)
     config.timesteps = tuple(1.0 - value for value in config.sigmas[:-1])
-    config.supports_stream_decode, config.min_decode_chunks = False, 3
+    config.supports_online_decode, config.min_decode_chunks = False, 3
 
 
 def backend(root) -> Backend:

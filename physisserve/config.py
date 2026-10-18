@@ -30,7 +30,7 @@ class Config:
     backend: str = field(init=False)
     dtype: str = field(init=False)
     compute_dtype: str | None = field(init=False, default=None)
-    supports_stream_decode: bool = field(init=False, default=True)
+    supports_online_decode: bool = field(init=False, default=True)
     min_decode_chunks: int = field(init=False, default=1)
 
     def __post_init__(self):

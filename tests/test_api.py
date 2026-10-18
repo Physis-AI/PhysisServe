@@ -49,14 +49,14 @@ def test_standard_diffusers_profiles(tmp_path, name, channels, blocks, backend, 
     assert (config.height, config.width, config.spatial_scale) == dimensions
     assert (config.chunks, config.fps) == (chunks, fps)
     assert (config.dtype, config.compute_dtype) == (dtype, compute_dtype)
-    assert config.supports_stream_decode == (backend == "wan")
+    assert config.supports_online_decode == (backend == "wan")
     assert config.min_decode_chunks == (3 if backend == "h3" else 1)
     assert config.patch_size == ((1, 1, 1) if backend == "ltx2" else (1, 2, 2))
     assert config.sigmas == sigmas and config.timesteps == timesteps
     sampler = config.make_sampler()
     assert sampler.sigmas == sigmas and sampler.timesteps == timesteps
     assert request.shape == shape and request.chunks == chunks and request.fps == fps
-    assert request.mode == "deferred_decode" and request.latent_dir is None
+    assert request.mode == "offline_decode" and request.latent_dir is None
     with pytest.raises(ValueError, match="spatial patch"):
         SamplingParams(width=831).request("cat", config)
     assert Config(str(tmp_path), strategy="stage_equal").max_batch == 1
@@ -81,7 +81,7 @@ def fake_config(model, *, ranks=1, strategy="virtual_rank", **kwargs):
     config = FakeConfig(ranks=ranks, strategy=strategy)
     config.backend, config.channels, config.height, config.width = "wan", 2, 2, 2
     config.spatial_scale, config.patch_size, config.chunks, config.fps = 1, (1, 1, 1), 5, 16
-    config.supports_stream_decode, config.min_decode_chunks = True, 1
+    config.supports_online_decode, config.min_decode_chunks = True, 1
     return config
 
 
@@ -90,17 +90,26 @@ def test_example_direct_api_writes_videos(monkeypatch, tmp_path):
     import imageio.v3 as iio
 
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
-    services = []
+    services, modes = [], []
 
     def make_service(model, **kwargs):
         service = PhysisServe(model, device="cpu", **kwargs)
         services.append(service)
+        requests = service._requests
+
+        def record_requests(prompts, params):
+            result = requests(prompts, params)
+            modes.extend(request.mode for request in result)
+            return result
+
+        monkeypatch.setattr(service, "_requests", record_requests)
         return service
 
     monkeypatch.setattr(example, "PhysisServe", make_service)
     try:
         example.main()
         assert len(services) == 1 and not services[0]._closed
+        assert modes == ["offline_decode", "offline_decode"]
         for index in range(2):
             assert iio.imread(tmp_path / f"video-{index}.mp4").shape == (13, 2, 2, 3)
         assert len(list((tmp_path / "latents").glob("generate-*/*.safetensors"))) == 2
@@ -110,7 +119,7 @@ def test_example_direct_api_writes_videos(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("ranks", [1, 2])
-def test_public_generate_unifies_single_multiple_and_deferred_video(monkeypatch, ranks):
+def test_public_generate_unifies_single_multiple_and_offline_video(monkeypatch, ranks):
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
     with PhysisServe("fake", device="cpu", pipeline_parallel_size=ranks) as model:
         params = SamplingParams(num_chunks=5, seed=17, mode="dit_only")
@@ -149,7 +158,8 @@ def test_worker_failure_is_reported_and_processes_are_reaped(monkeypatch):
 
 @pytest.mark.parametrize("kwargs", [
     {"num_chunks": 0}, {"height": -1}, {"seed": -1}, {"fps": True},
-    {"mode": "video"}, {"mode": None}, {"mode": []},
+    {"mode": "video"}, {"mode": "stream_decode"}, {"mode": "deferred_decode"},
+    {"mode": None}, {"mode": []},
     {"latent_dir": ""}, {"latent_dir": "  "}, {"latent_dir": 3},
 ])
 def test_invalid_sampling_inputs(kwargs):
@@ -157,7 +167,7 @@ def test_invalid_sampling_inputs(kwargs):
         SamplingParams(**kwargs)
 
 
-@pytest.mark.parametrize("mode", ["dit_only", "deferred_decode", "stream_decode"])
+@pytest.mark.parametrize("mode", ["dit_only", "offline_decode", "online_decode"])
 def test_sampling_mode_and_latent_directory_reach_request(tmp_path, mode):
     target = tmp_path / "latents"
     params = SamplingParams(mode=mode, latent_dir=str(target))
@@ -179,50 +189,50 @@ def test_mixed_modes_decode_after_all_streams_and_preserve_order_and_rejections(
     model.config = fake_config("fake")
     events = []
     outputs = [{"prompt": prompt, "latents": index}
-               for index, prompt in enumerate(("raw", "deferred", "stream", "rejected", "deferred2"))]
-    outputs[2]["video"] = "streamed video"
+               for index, prompt in enumerate(("raw", "offline", "online", "rejected", "offline2"))]
+    outputs[2]["video"] = "online video"
     outputs[3] = {"prompt": "rejected", "status": "rejected", "reason": "capacity"}
 
     def call(operation, *args, **kwargs):
         events.append(operation)
         if operation == "prepare":
             assert [request.mode for request in args[0]] == [
-                "dit_only", "deferred_decode", "stream_decode", "deferred_decode", "deferred_decode"]
+                "dit_only", "offline_decode", "online_decode", "offline_decode", "offline_decode"]
             return [None]
         if operation == "run":
             return [outputs]
         assert operation == "decode" and events == ["prepare", "run", "decode"]
-        assert [output["prompt"] for output in args[0]] == ["deferred", "deferred2"]
+        assert [output["prompt"] for output in args[0]] == ["offline", "offline2"]
         return [[{**output, "video": "decoded video"} for output in args[0]]]
 
     model._call = call
     result = model.generate([output["prompt"] for output in outputs], [
         SamplingParams(mode=mode) for mode in
-        ("dit_only", "deferred_decode", "stream_decode", "deferred_decode", "deferred_decode")])
+        ("dit_only", "offline_decode", "online_decode", "offline_decode", "offline_decode")])
     assert events == ["prepare", "run", "decode"]
-    assert [output["prompt"] for output in result] == ["raw", "deferred", "stream", "rejected", "deferred2"]
+    assert [output["prompt"] for output in result] == ["raw", "offline", "online", "rejected", "offline2"]
     assert "video" not in result[0] and "video" not in result[3]
     assert result[1]["video"] == result[4]["video"] == "decoded video"
-    assert result[2]["video"] == "streamed video"
+    assert result[2]["video"] == "online video"
     assert result[3] == {"prompt": "rejected", "status": "rejected", "reason": "capacity"}
 
 
 @pytest.mark.parametrize("backend", ["h3", "ltx2"])
-def test_whole_sequence_vae_rejects_stream_mode_before_worker_call(backend):
+def test_whole_sequence_vae_rejects_online_mode_before_worker_call(backend):
     model = PhysisServe.__new__(PhysisServe)
     model.config = fake_config("fake")
     model.config.backend = backend
-    model.config.supports_stream_decode = False
+    model.config.supports_online_decode = False
     model._call = lambda *args, **kwargs: pytest.fail("unsupported mode must fail before worker calls")
-    with pytest.raises(ValueError, match="whole-sequence VAE.*stream_decode"):
-        model.generate(["cat", "dog"], [SamplingParams(), SamplingParams(mode="stream_decode")])
+    with pytest.raises(ValueError, match="whole-sequence VAE.*online_decode"):
+        model.generate(["cat", "dog"], [SamplingParams(), SamplingParams(mode="online_decode")])
 
 
 def test_h3_short_chunks_allowed_only_for_dit_mode():
     model = PhysisServe.__new__(PhysisServe)
     model.config = fake_config("fake")
     model.config.backend = "h3"
-    model.config.supports_stream_decode, model.config.min_decode_chunks = False, 3
+    model.config.supports_online_decode, model.config.min_decode_chunks = False, 3
     calls = []
 
     def call(operation, *args, **kwargs):

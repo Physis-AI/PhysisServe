@@ -4,10 +4,10 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class SamplingParams:
-    """``dit_only`` returns latents; ``deferred_decode`` decodes after all streams.
+    """``dit_only`` returns latents; ``offline_decode`` decodes after all streams.
 
-    ``stream_decode`` decodes each completed chunk while denoising continues.
-    ``deferred_decode`` saves latents under ``latent_dir`` (default: ./latents)
+    ``online_decode`` decodes each completed chunk while denoising continues.
+    ``offline_decode`` saves latents under ``latent_dir`` (default: ./latents)
     before decoding. Each generation gets a separate subdirectory. Other modes
     save latents only when ``latent_dir`` is specified.
     """
@@ -17,7 +17,7 @@ class SamplingParams:
     width: int | None = None
     fps: int | None = None
     seed: int = 0
-    mode: str = "deferred_decode"
+    mode: str = "offline_decode"
     latent_dir: str | Path | None = None
 
     def __post_init__(self):
@@ -27,8 +27,8 @@ class SamplingParams:
                 raise ValueError(f"{name} must be a positive integer")
         if type(self.seed) is not int or not 0 <= self.seed < 2**31:
             raise ValueError("seed must be an integer in [0, 2**31)")
-        if self.mode not in ("dit_only", "deferred_decode", "stream_decode"):
-            raise ValueError("mode must be dit_only, deferred_decode, or stream_decode")
+        if self.mode not in ("dit_only", "offline_decode", "online_decode"):
+            raise ValueError("mode must be dit_only, offline_decode, or online_decode")
         if self.latent_dir is not None:
             if not isinstance(self.latent_dir, (str, Path)) or not str(self.latent_dir).strip():
                 raise ValueError("latent_dir must be a nonempty directory path")

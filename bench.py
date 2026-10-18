@@ -1,4 +1,4 @@
-"""Compare StageEqual and VirtualRank on identical single or concurrent streams."""
+"""Compare StageEqual and VirtualRank on identical streams in dit_only mode."""
 import argparse
 import json
 from pathlib import Path

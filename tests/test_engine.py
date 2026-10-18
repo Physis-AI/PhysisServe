@@ -178,7 +178,7 @@ def test_interleaved_streams_equal_independent_requests_and_reuse_weights(strate
 
 
 @pytest.mark.parametrize("sequence", [False, True])
-def test_deferred_decode_resets_each_video_and_accounts_for_first_chunk(sequence, monkeypatch):
+def test_offline_decode_resets_each_video_and_accounts_for_first_chunk(sequence, monkeypatch):
     config = FakeConfig(sequence=sequence)
     engine = Engine(config)
     engine.prepare(requests())

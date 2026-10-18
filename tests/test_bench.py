@@ -1,10 +1,38 @@
 import pytest
 
+import bench
 from bench import summarize
+from physisserve import PhysisServe
+from tests.test_api import fake_config
 
 
 def row(stream, times, batch):
     return {"times": {stream: list(enumerate(times))}, "max_batch": batch}
+
+
+def test_benchmark_requests_are_dit_only_for_both_strategies(monkeypatch):
+    services = []
+
+    def make_service(model, **kwargs):
+        service = PhysisServe.__new__(PhysisServe)
+        service.config = fake_config(model, **kwargs)
+
+        def measure(operation, requests, warmups, repeats):
+            assert operation is bench.measure
+            assert [request.mode for request in requests] == ["dit_only"]
+            return [[row(0, [1, 2, 3], 1)]]
+
+        service._call = measure
+        service.close = lambda: None
+        services.append(service)
+        return service
+
+    monkeypatch.setattr(bench, "PhysisServe", make_service)
+    monkeypatch.setattr(bench.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr("sys.argv", ["bench.py", "fake", "--chunks", "3", "--skip-chunks", "0",
+                                     "--warmups", "0", "--repeats", "1"])
+    bench.main()
+    assert [service.config.strategy for service in services] == ["stage_equal", "virtual_rank"]
 
 
 def test_benchmark_aggregates_same_rank_gaps_and_discards_bootstrap():

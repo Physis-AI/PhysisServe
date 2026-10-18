@@ -33,7 +33,7 @@ class Engine:
         self.codec_dtype = getattr(torch, config.compute_dtype or config.dtype)
         backend = config.make_backend(config.model)
         self.blocks, self.first_frames = backend.dit.num_blocks, backend.dit.first_frames
-        self.supports_stream_decode = (callable(getattr(backend.decoder, "decode", None))
+        self.supports_online_decode = (callable(getattr(backend.decoder, "decode", None))
                                        and not callable(getattr(backend.decoder, "decode_sequence", None)))
         self.sampler = config.make_sampler()
         self.runners = {}
@@ -66,8 +66,8 @@ class Engine:
         self._check_idle()
         self.prepared = False
         self.requests, self.sessions = tuple(requests), ()
-        if not self.supports_stream_decode and any(r.mode == "stream_decode" for r in self.requests):
-            raise ValueError("this VAE requires whole-sequence decoding; use deferred_decode")
+        if not self.supports_online_decode and any(r.mode == "online_decode" for r in self.requests):
+            raise ValueError("this VAE requires whole-sequence decoding; use offline_decode")
         ids = {str(index) for index in range(len(self.requests))}
         if placement is None:
             layout = self.config.make_layout()
@@ -129,7 +129,7 @@ class Engine:
         Callbacks receive the input index followed by the runner's chunk/latent or
         rank/batch-size values. dit_only retains outputs on the device until all
         streams finish. Other modes buffer completed latents in CPU memory;
-        stream_decode additionally decodes each chunk before advancing this rank.
+        online_decode additionally decodes each chunk before advancing this rank.
         Calling run again reuses weights and starts fresh KV state and seeded noise.
         """
         self._check_idle()
@@ -143,7 +143,7 @@ class Engine:
         try:
             for index, ticks, runner, condition in self.sessions:
                 request = self.requests[index]
-                if self.is_output and request.mode == "stream_decode":
+                if self.is_output and request.mode == "online_decode":
                     decoder = self.config.make_backend(self.config.model).decoder
                     decoder.load(self.device, self.codec_dtype)
                     decoder.reset()
@@ -205,7 +205,7 @@ class Engine:
                                   chunks=request.chunks, first_frames=self.first_frames)
                     if index in videos:
                         result["video"] = torch.cat(videos[index], dim=0)
-                    if request.latent_dir is not None or request.mode == "deferred_decode":
+                    if request.latent_dir is not None or request.mode == "offline_decode":
                         root = Path(request.latent_dir or "latents").expanduser().resolve()
                         if root not in directories:
                             root.mkdir(parents=True, exist_ok=True)
