@@ -5,7 +5,7 @@ stage placement and batch dispatch policies live in the strategies package.
 """
 from dataclasses import dataclass
 
-from ..contract import DENOISING_STEPS
+from .sampler import DENOISING_STEPS
 
 
 @dataclass(frozen=True, order=True)

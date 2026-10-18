@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..contract import DENOISING_STEPS
+DENOISING_STEPS = 4
 
 
 @dataclass(frozen=True, init=False)

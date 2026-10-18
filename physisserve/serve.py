@@ -137,10 +137,10 @@ class PhysisServe:
         requests = self._requests(prompts, sampling_params)
         if not requests:
             return []
-        if self.config.backend in ("h3", "ltx2") and any(r.mode == "stream_decode" for r in requests):
+        if not self.config.supports_stream_decode and any(r.mode == "stream_decode" for r in requests):
             raise ValueError(f"{self.config.backend} uses a whole-sequence VAE; stream_decode is unsupported")
-        if self.config.backend == "h3" and any(r.mode != "dit_only" and r.chunks < 3 for r in requests):
-            raise ValueError("H3 video decoding requires at least 3 chunks")
+        if any(r.mode != "dit_only" and r.chunks < self.config.min_decode_chunks for r in requests):
+            raise ValueError(f"{self.config.backend} video decoding requires at least {self.config.min_decode_chunks} chunks")
         self._call("prepare", requests, placement=placement)
         outputs = self._call("run")[0]
         deferred = [index for index, request in enumerate(requests)

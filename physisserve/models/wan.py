@@ -19,14 +19,28 @@ from ..engine.kv_cache import BatchCache
 from .base import Backend, block_indices, load_selected_weights
 
 
-def backend(root, text_length=None, cache_text_kv=False) -> Backend:
-    """Build a backend from a complete Diffusers package root.
+def configure(config):
+    config.dtype = "bfloat16"
+    if config.channels == 48:
+        config.height, config.width, config.spatial_scale, config.chunks, config.fps = 704, 1280, 16, 29, 24
+        config.sigmas = (1.0, 0.9097071290016174, 0.7173174619674683, 0.0244140625, 0.0)
+        config.timesteps = tuple(1000.0 * value for value in config.sigmas[:-1])
+    elif config.channels == 16 and config.num_blocks in (30, 40):
+        config.height, config.width, config.spatial_scale, config.chunks, config.fps = 480, 832, 8, 19, 16
+        if config.num_blocks == 30:
+            config.sigmas = (1.0, 0.750257670879364, 0.499718636274338, 0.250000029802322, 0.0)
+            config.timesteps = (1000.0, 750.0, 500.0, 250.0)
+        else:
+            config.sigmas = (0.700232386589050, 0.499718636274338, 0.400259941816330, 0.198347106575966, 0.0)
+            config.timesteps = (700.0, 500.0, 400.0, 200.0)
+    else:
+        raise ValueError("supported Wan models are 2.1 1.3B, 2.1 14B and 2.2 5B")
 
-    ``text_length`` defaults to Diffusers' WanPipeline maximum of 512.
-    """
+
+def backend(root) -> Backend:
+    """Build the Wan components with cached text projections and 512-token prompts."""
     root = Path(root)
-    return Backend(WanDiT(root / "transformer", cache_text_kv=cache_text_kv),
-                   WanEncoder(root, **({} if text_length is None else {"max_length": text_length})), WanDecoder(root))
+    return Backend(WanDiT(root / "transformer", cache_text_kv=True), WanEncoder(root), WanDecoder(root))
 
 
 def _rope(x, cosine, sine):

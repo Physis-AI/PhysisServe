@@ -16,10 +16,9 @@ from typing import Iterator
 import torch
 import torch.distributed as dist
 
-from ..contract import DENOISING_STEPS, require_one_latent_per_chunk
 from .chunks import Chunks
 from .kv_cache import Cache, KVCache
-from .sampler import Sampler
+from .sampler import DENOISING_STEPS, Sampler
 from .scheduler import Task
 from .transport import Distributed, Local
 
@@ -159,7 +158,8 @@ class ModelRunner:
             raise RuntimeError("a ModelRunner serves one request at a time; exhaust the previous run first")
         self.busy = True
         try:
-            require_one_latent_per_chunk(shape)
+            if len(shape) != 5 or shape[2] != 1:
+                raise ValueError("PhysisServe requires exactly one temporal latent per chunk (shape[2] must be 1)")
             geometry = Chunks(shape, chunks, self.first_frames)
             schedules = _request_schedules(self.layout, self.dit.num_blocks, chunks)
             yield from self._run_sink_first(

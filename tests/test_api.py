@@ -1,4 +1,6 @@
+import importlib
 import json
+import pickle
 
 import pytest
 import torch
@@ -9,14 +11,30 @@ from physisserve.sampling_params import Request
 from tests.test_engine import FakeConfig
 
 
-@pytest.mark.parametrize("name,channels,blocks,backend,shape,chunks,fps", [
-    ("WanTransformer3DModel", 16, 30, "wan", (1, 16, 1, 60, 104), 19, 16),
-    ("WanTransformer3DModel", 16, 40, "wan", (1, 16, 1, 60, 104), 19, 16),
-    ("WanTransformer3DModel", 48, 30, "wan", (1, 48, 1, 44, 80), 29, 24),
-    ("LTX2VideoTransformer3DModel", 128, 48, "ltx2", (1, 128, 1, 17, 30), 14, 24),
-    ("MiniMaxH3Transformer3DModel", 24, 50, "h3", (1, 24, 1, 48, 84), 48, 24),
+@pytest.mark.parametrize("name,channels,blocks,backend,shape,dimensions,chunks,fps,dtype,compute_dtype,sigmas,timesteps", [
+    ("WanTransformer3DModel", 16, 30, "wan", (1, 16, 1, 60, 104), (480, 832, 8), 19, 16,
+     "bfloat16", None,
+     (1.0, 0.750257670879364, 0.499718636274338, 0.250000029802322, 0.0),
+     (1000.0, 750.0, 500.0, 250.0)),
+    ("WanTransformer3DModel", 16, 40, "wan", (1, 16, 1, 60, 104), (480, 832, 8), 19, 16,
+     "bfloat16", None,
+     (0.700232386589050, 0.499718636274338, 0.400259941816330, 0.198347106575966, 0.0),
+     (700.0, 500.0, 400.0, 200.0)),
+    ("WanTransformer3DModel", 48, 30, "wan", (1, 48, 1, 44, 80), (704, 1280, 16), 29, 24,
+     "bfloat16", None,
+     (1.0, 0.9097071290016174, 0.7173174619674683, 0.0244140625, 0.0),
+     (1000.0, 909.7071290016174, 717.3174619674683, 24.4140625)),
+    ("LTX2VideoTransformer3DModel", 128, 48, "ltx2", (1, 128, 1, 17, 30), (544, 960, 32), 14, 24,
+     "float32", "bfloat16",
+     (1.0, 0.8920687437057495, 0.6825016736984253, 0.10000002384185791, 0.0),
+     (1000.0, 892.0687437057495, 682.5016736984253, 100.00002384185791)),
+    ("MiniMaxH3Transformer3DModel", 24, 50, "h3", (1, 24, 1, 48, 84), (768, 1344, 16), 48, 24,
+     "bfloat16", None,
+     (1.0, 0.9097071290016174, 0.7173174619674683, 0.0244140625, 0.0),
+     (0.0, 0.09029287099838257, 0.28268253803253174, 0.9755859375)),
 ])
-def test_standard_diffusers_profiles(tmp_path, name, channels, blocks, backend, shape, chunks, fps):
+def test_standard_diffusers_profiles(tmp_path, name, channels, blocks, backend, shape, dimensions,
+                                    chunks, fps, dtype, compute_dtype, sigmas, timesteps):
     for component in ("transformer", "vae", "text_encoder", "tokenizer"):
         (tmp_path / component).mkdir()
     (tmp_path / "model_index.json").write_text(json.dumps({"transformer": ["diffusers", name]}))
@@ -25,27 +43,45 @@ def test_standard_diffusers_profiles(tmp_path, name, channels, blocks, backend, 
         "patch_size": 1 if backend == "ltx2" else [1, 2, 2],
     }))
     config = Config(str(tmp_path))
+    assert vars(pickle.loads(pickle.dumps(config))) == vars(config)
     request = SamplingParams().request("cat", config)
-    assert config.backend == backend and config.num_blocks == blocks
+    assert (config.backend, config.num_blocks, config.channels) == (backend, blocks, channels)
+    assert (config.height, config.width, config.spatial_scale) == dimensions
+    assert (config.chunks, config.fps) == (chunks, fps)
+    assert (config.dtype, config.compute_dtype) == (dtype, compute_dtype)
+    assert config.supports_stream_decode == (backend == "wan")
+    assert config.min_decode_chunks == (3 if backend == "h3" else 1)
+    assert config.patch_size == ((1, 1, 1) if backend == "ltx2" else (1, 2, 2))
+    assert config.sigmas == sigmas and config.timesteps == timesteps
+    sampler = config.make_sampler()
+    assert sampler.sigmas == sigmas and sampler.timesteps == timesteps
     assert request.shape == shape and request.chunks == chunks and request.fps == fps
     assert request.mode == "deferred_decode" and request.latent_dir is None
-    assert len(config.make_sampler().sigmas) == 5 and config.make_sampler().sigmas[-1] == 0
-    if backend == "ltx2":
-        assert config.dtype == "float32" and config.compute_dtype == "bfloat16"
-        assert config.sigmas[1:4] == pytest.approx((0.8920687437, 0.6825016737, 0.1000000238))
-    elif backend == "h3":
-        assert config.timesteps == pytest.approx(tuple(1 - value for value in config.sigmas[:-1]))
-    elif channels == 16:
-        assert config.timesteps == ((1000, 750, 500, 250) if blocks == 30 else (700, 500, 400, 200))
     with pytest.raises(ValueError, match="spatial patch"):
         SamplingParams(width=831).request("cat", config)
     assert Config(str(tmp_path), strategy="stage_equal").max_batch == 1
+
+
+@pytest.mark.parametrize("family,dit_class,options,text_length", [
+    ("wan", "WanDiT", {"cache_text_kv": True}, 512),
+    ("ltx2", "LTX2DiT", {"compute_dtype": torch.bfloat16}, 1024),
+    ("h3", "H3DiT", {}, None),
+])
+def test_model_factories_own_component_defaults(monkeypatch, tmp_path, family, dit_class, options, text_length):
+    (tmp_path / "vae").mkdir()
+    (tmp_path / "vae" / "config.json").write_text("{}")
+    module = importlib.import_module(f"physisserve.models.{family}")
+    monkeypatch.setattr(module, dit_class, lambda source, **kwargs: (source, kwargs))
+    backend = module.backend(tmp_path)
+    assert backend.dit == (tmp_path / "transformer", options)
+    assert backend.encoder.max_length == text_length
 
 
 def fake_config(model, *, ranks=1, strategy="virtual_rank", **kwargs):
     config = FakeConfig(ranks=ranks, strategy=strategy)
     config.backend, config.channels, config.height, config.width = "wan", 2, 2, 2
     config.spatial_scale, config.patch_size, config.chunks, config.fps = 1, (1, 1, 1), 5, 16
+    config.supports_stream_decode, config.min_decode_chunks = True, 1
     return config
 
 
@@ -152,6 +188,7 @@ def test_whole_sequence_vae_rejects_stream_mode_before_worker_call(backend):
     model = PhysisServe.__new__(PhysisServe)
     model.config = fake_config("fake")
     model.config.backend = backend
+    model.config.supports_stream_decode = False
     model._call = lambda *args, **kwargs: pytest.fail("unsupported mode must fail before worker calls")
     with pytest.raises(ValueError, match="whole-sequence VAE.*stream_decode"):
         model.generate(["cat", "dog"], [SamplingParams(), SamplingParams(mode="stream_decode")])
@@ -161,6 +198,7 @@ def test_h3_short_chunks_allowed_only_for_dit_mode():
     model = PhysisServe.__new__(PhysisServe)
     model.config = fake_config("fake")
     model.config.backend = "h3"
+    model.config.supports_stream_decode, model.config.min_decode_chunks = False, 3
     calls = []
 
     def call(operation, *args, **kwargs):

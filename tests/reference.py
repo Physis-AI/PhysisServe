@@ -5,10 +5,10 @@ topology of the engine must match it bit for bit.
 """
 import torch
 
-from physisserve.contract import DENOISING_STEPS
 from physisserve.engine.chunks import Chunks
 from physisserve.engine.kv_cache import Cache, history_chunks
 from physisserve.engine.model_runner import generator
+from physisserve.engine.sampler import DENOISING_STEPS
 
 
 @torch.inference_mode()

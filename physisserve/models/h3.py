@@ -20,12 +20,20 @@ from ..engine.kv_cache import BatchCache
 from .base import Backend, block_indices, drop_attributes, load_selected_weights
 
 
-def backend(root, text_length=None) -> Backend:
+def configure(config):
+    config.dtype = "bfloat16"
+    config.height, config.width, config.spatial_scale, config.chunks, config.fps = 768, 1344, 16, 48, 24
+    config.sigmas = (1.0, 0.9097071290016174, 0.7173174619674683, 0.0244140625, 0.0)
+    config.timesteps = tuple(1.0 - value for value in config.sigmas[:-1])
+    config.supports_stream_decode, config.min_decode_chunks = False, 3
+
+
+def backend(root) -> Backend:
     """Build the video-only H3 components from an official Diffusers layout."""
     root = Path(root)
     return Backend(
         H3DiT(root / "transformer"),
-        H3Encoder(root, max_length=text_length),
+        H3Encoder(root),
         H3LatentDecoder(root),
     )
 

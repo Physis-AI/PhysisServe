@@ -5,8 +5,8 @@ import gc
 import weakref
 import torch
 
-from physisserve.contract import DENOISING_STEPS
 from physisserve.engine.kv_cache import KVCache, history_chunks
+from physisserve.engine.sampler import DENOISING_STEPS
 from physisserve.engine.strategies import VirtualRank, StageEqual
 from physisserve.engine.scheduler import Schedule, Task
 

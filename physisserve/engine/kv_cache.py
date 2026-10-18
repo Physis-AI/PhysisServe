@@ -10,8 +10,10 @@ releases each page after its last local read; historical KV never transfers betw
 """
 import torch
 
-from ..contract import ATTENTION_SINK_CHUNKS, HISTORY_CHUNKS
 from .scheduler import Schedule, Task
+
+ATTENTION_SINK_CHUNKS = 1
+HISTORY_CHUNKS = 18
 
 
 def history_chunks(chunk: int) -> list[int]:

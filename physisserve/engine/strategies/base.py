@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 
-from ...contract import DENOISING_STEPS
+from ..sampler import DENOISING_STEPS
 from ..scheduler import Schedule, Task
 
 

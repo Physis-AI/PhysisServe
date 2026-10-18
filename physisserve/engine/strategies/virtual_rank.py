@@ -5,7 +5,7 @@ from functools import lru_cache
 from math import isfinite
 from numbers import Real
 
-from ...contract import DENOISING_STEPS
+from ..sampler import DENOISING_STEPS
 from ..scheduler import Task
 from .base import BatchSchedule, _StaticPlacement, _batch_limit, _positive_int, _ranks
 

@@ -20,15 +20,19 @@ from ..engine.kv_cache import BatchCache
 from .base import Backend, block_indices, drop_attributes, load_selected_weights
 
 
+def configure(config):
+    config.dtype, config.compute_dtype = "float32", "bfloat16"
+    config.height, config.width, config.spatial_scale, config.chunks, config.fps = 544, 960, 32, 14, 24
+    config.patch_size = (1, 1, 1)
+    config.sigmas = (1.0, 0.8920687437057495, 0.6825016736984253, 0.10000002384185791, 0.0)
+    config.timesteps = tuple(1000.0 * value for value in config.sigmas[:-1])
+    config.supports_stream_decode = False
 
-def backend(root, text_length=None, compute_dtype=None) -> Backend:
-    """Build a backend from a complete Diffusers package root.
 
-    ``text_length`` defaults to Diffusers' LTX2Pipeline maximum of 1024. ``compute_dtype``: see ``LTX2DiT``.
-    """
+def backend(root) -> Backend:
+    """Build the LTX components with bf16 computation and 1024-token prompts."""
     root = Path(root)
-    return Backend(LTX2DiT(root / "transformer", compute_dtype=compute_dtype),
-                   LTX2Encoder(root, **({} if text_length is None else {"max_length": text_length})), LTX2Decoder(root))
+    return Backend(LTX2DiT(root / "transformer", compute_dtype=torch.bfloat16), LTX2Encoder(root), LTX2Decoder(root))
 
 
 def _autocast(device, dtype):
