@@ -6,18 +6,6 @@ from ..sampler import DENOISING_STEPS
 from ..scheduler import Schedule, Task
 
 
-def _equal_parts(length: int, count: int) -> tuple[range, ...]:
-    quotient, remainder = divmod(length, count)
-    cuts = [0]
-    for rank in range(count):
-        cuts.append(cuts[-1] + quotient + (rank < remainder))
-    return tuple(range(left, right) for left, right in zip(cuts, cuts[1:]))
-
-
-def _owners(parts: tuple[range, ...]) -> tuple[int, ...]:
-    return tuple(rank for rank, part in enumerate(parts) for _ in part)
-
-
 class BatchSchedule(Schedule):
     """Schedule-compatible cells plus explicit sequential batches per tick.
 

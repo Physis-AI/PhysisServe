@@ -2,7 +2,7 @@
 
 from ..sampler import DENOISING_STEPS
 from ..scheduler import Task
-from .base import BatchSchedule, _StaticPlacement, _equal_parts, _owners
+from .base import BatchSchedule, _StaticPlacement
 
 
 class StageEqual(_StaticPlacement):
@@ -28,7 +28,8 @@ class StageEqual(_StaticPlacement):
         ranks = stages if self.ranks is None else self.ranks
         if ranks > stages:
             raise ValueError("stage-equal placement requires ranks <= four times blocks")
-        return _owners(_equal_parts(stages, ranks))
+        quotient, remainder = divmod(stages, ranks)
+        return tuple(rank for rank in range(ranks) for _ in range(quotient + (rank < remainder)))
 
     def schedule(self, blocks: int, chunks: int) -> BatchSchedule:
         owners = self._stage_owners(blocks)

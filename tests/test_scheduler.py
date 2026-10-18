@@ -49,6 +49,14 @@ LAYOUTS = [StageEqual(), StageEqual(3),
            VirtualRank(2, max_batch=1, batch_costs=[[1]] * 3)]
 
 
+@pytest.mark.parametrize("blocks,ranks,counts", [
+    (3, 1, [12]), (3, 5, [3, 3, 2, 2, 2]), (3, None, [1] * 12), (50, 200, [1] * 200),
+])
+def test_stage_equal_keeps_contiguous_balanced_ownership(blocks, ranks, counts):
+    owners = StageEqual(ranks)._stage_owners(blocks)
+    assert owners == tuple(rank for rank, count in enumerate(counts) for _ in range(count))
+
+
 @pytest.mark.parametrize("layout", LAYOUTS)
 def test_static_kv_cache_read_sets_and_lifetimes(layout):
     blocks, chunks = 3, 26

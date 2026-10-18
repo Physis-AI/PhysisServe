@@ -10,35 +10,16 @@ from .stage_equal import StageEqual
 from .virtual_rank import VirtualRank
 
 
-def _integer(value, name, minimum=0):
-    if type(value) is not int or value < minimum:
-        raise ValueError(f"{name} must be an integer >= {minimum}")
-
-
-def _number(value, name, positive=False):
-    if (isinstance(value, bool) or not isinstance(value, Real) or not isfinite(value)
-            or (value <= 0 if positive else value < 0)):
-        raise ValueError(f"{name} must be a finite {'positive' if positive else 'nonnegative'} number")
-
-
 @dataclass(frozen=True)
 class RankDemand:
     memory_bytes: int
     utilization: float
-
-    def __post_init__(self):
-        _integer(self.memory_bytes, "memory_bytes")
-        _number(self.utilization, "utilization")
 
 
 @dataclass(frozen=True)
 class DeviceBudget:
     memory_bytes: int
     utilization: float = 1.0
-
-    def __post_init__(self):
-        _integer(self.memory_bytes, "memory_bytes", 1)
-        _number(self.utilization, "utilization", positive=True)
 
 
 @dataclass(frozen=True)
@@ -47,17 +28,6 @@ class Candidate:
     layout: StageEqual | VirtualRank
     demands: tuple[RankDemand, ...]
     max_gap_ms: float | None = None
-
-    def __post_init__(self):
-        if not isinstance(self.name, str) or not self.name:
-            raise ValueError("candidate name must be a nonempty string")
-        if type(self.layout) not in (StageEqual, VirtualRank):
-            raise ValueError("layout must be StageEqual or VirtualRank")
-        object.__setattr__(self, "demands", tuple(self.demands))
-        if not self.demands or any(not isinstance(item, RankDemand) for item in self.demands):
-            raise ValueError("demands must contain one RankDemand per local rank")
-        if self.max_gap_ms is not None:
-            _number(self.max_gap_ms, "max_gap_ms", positive=True)
 
 
 @dataclass(frozen=True)
@@ -68,40 +38,12 @@ class StreamCandidates:
     slo_ms: float
     candidates: tuple[Candidate, ...]
 
-    def __post_init__(self):
-        if not isinstance(self.stream_id, str) or not self.stream_id:
-            raise ValueError("stream_id must be a nonempty string")
-        _integer(self.blocks, "blocks", 1)
-        _integer(self.chunks, "chunks", 1)
-        _number(self.slo_ms, "slo_ms", positive=True)
-        object.__setattr__(self, "candidates", tuple(self.candidates))
-        names = set()
-        for candidate in self.candidates:
-            if not isinstance(candidate, Candidate):
-                raise ValueError("candidates must contain Candidate objects")
-            if candidate.name in names:
-                raise ValueError("candidate names must be unique within a stream")
-            names.add(candidate.name)
-            if candidate.layout.num_ranks(self.blocks) != len(candidate.demands):
-                raise ValueError("demands must cover exactly the layout's local ranks")
-
 
 @dataclass(frozen=True)
 class StreamPlacement:
     stream_id: str
     candidate: Candidate
     rank_map: tuple[int, ...]
-
-    def __post_init__(self):
-        if not isinstance(self.stream_id, str) or not self.stream_id:
-            raise ValueError("stream_id must be a nonempty string")
-        if not isinstance(self.candidate, Candidate):
-            raise ValueError("candidate must be a Candidate")
-        object.__setattr__(self, "rank_map", tuple(self.rank_map))
-        if len(self.rank_map) != len(self.candidate.demands):
-            raise ValueError("rank_map must cover every candidate local rank")
-        for rank in self.rank_map:
-            _integer(rank, "physical rank")
 
 
 @dataclass(frozen=True)
@@ -118,29 +60,55 @@ class PoolPlan:
     def validate(self, ranks, blocks, streams):
         if (not isinstance(self.placements, (list, tuple)) or not isinstance(self.rejected, dict)
                 or not isinstance(self.loads, (list, tuple))
-                or any(type(load) is not RankDemand for load in self.loads)
                 or any(not isinstance(reason, str) for reason in self.rejected.values())):
             raise ValueError("placement requires placements, string rejection reasons and RankDemand loads")
         if self.num_ranks != ranks:
             raise ValueError("placement must use the configured GPU pool")
-        if any(type(item) is not StreamPlacement for item in self.placements):
-            raise ValueError("placements must contain StreamPlacement objects")
+        for load in self.loads:
+            if (type(load) is not RankDemand or type(load.memory_bytes) is not int or load.memory_bytes < 0
+                    or isinstance(load.utilization, bool) or not isinstance(load.utilization, Real)
+                    or not isfinite(load.utilization) or load.utilization < 0):
+                raise ValueError("loads must contain nonnegative integer memory and finite nonnegative utilization")
+        if any(type(item) is not StreamPlacement or not isinstance(item.stream_id, str)
+               or not item.stream_id for item in self.placements):
+            raise ValueError("placements must contain StreamPlacement objects with nonempty stream IDs")
         placed = [item.stream_id for item in self.placements]
         if (len(set(placed)) != len(placed) or set(placed) & set(self.rejected)
                 or set(placed) | set(self.rejected) != {str(index) for index in range(streams)}):
             raise ValueError("placement must cover every input index exactly once")
         for item in self.placements:
-            if item.candidate.layout.num_ranks(blocks) != len(item.rank_map):
+            _validate_candidates((item.candidate,), blocks)
+            if not isinstance(item.rank_map, (list, tuple)) or len(item.rank_map) != len(item.candidate.demands):
                 raise ValueError("rank_map must cover exactly the single-stream local ranks")
-            if any(rank >= ranks for rank in item.rank_map):
-                raise ValueError("mapped rank is outside the pool")
+            if any(type(rank) is not int or not 0 <= rank < ranks for rank in item.rank_map):
+                raise ValueError("mapped ranks must be integers inside the pool")
 
 
-def _budgets(budgets):
-    budgets = tuple(budgets)
-    if not budgets or any(not isinstance(budget, DeviceBudget) for budget in budgets):
-        raise ValueError("budgets must contain at least one DeviceBudget")
-    return budgets
+def _validate_candidates(candidates, blocks):
+    # Shared by the two public boundaries; internal search only handles validated data.
+    if not isinstance(candidates, (list, tuple)):
+        raise ValueError("candidates must be a list or tuple")
+    names = set()
+    for candidate in candidates:
+        if type(candidate) is not Candidate or not isinstance(candidate.name, str) or not candidate.name:
+            raise ValueError("candidates must contain Candidate objects with nonempty names")
+        if candidate.name in names:
+            raise ValueError("candidate names must be unique within a stream")
+        names.add(candidate.name)
+        if type(candidate.layout) not in (StageEqual, VirtualRank):
+            raise ValueError("layout must be StageEqual or VirtualRank")
+        if not isinstance(candidate.demands, (list, tuple)) or not candidate.demands:
+            raise ValueError("demands must contain one RankDemand per local rank")
+        for demand in candidate.demands:
+            if (type(demand) is not RankDemand or type(demand.memory_bytes) is not int or demand.memory_bytes < 0
+                    or isinstance(demand.utilization, bool) or not isinstance(demand.utilization, Real)
+                    or not isfinite(demand.utilization) or demand.utilization < 0):
+                raise ValueError("demands must contain nonnegative integer memory and finite nonnegative utilization")
+        gap = candidate.max_gap_ms
+        if gap is not None and (isinstance(gap, bool) or not isinstance(gap, Real) or not isfinite(gap) or gap <= 0):
+            raise ValueError("max_gap_ms must be a finite positive number")
+        if candidate.layout.num_ranks(blocks) != len(candidate.demands):
+            raise ValueError("demands must cover exactly the layout's local ranks")
 
 
 def _fits(load, demand, budget):
@@ -221,15 +189,32 @@ def plan_pool(problems: Sequence[StreamCandidates], budgets: Sequence[DeviceBudg
               lds_discrepancies=2, search_limit=10000) -> PoolPlan:
     """Place arrivals without moving accepted streams. Demands are summed per GPU.
 
-    Input max_gap_ms must be measured for each candidate; pooled execution must
-    still satisfy the caller's delivery target. Search is bounded per arrival.
+    Validate all input records before searching. Input max_gap_ms must be measured
+    for each candidate; pooled execution must still satisfy the caller's delivery
+    target. Search is bounded per arrival.
     """
-    _integer(lds_discrepancies, "lds_discrepancies")
-    _integer(search_limit, "search_limit", 1)
-    budgets = _budgets(budgets)
+    if type(lds_discrepancies) is not int or lds_discrepancies < 0:
+        raise ValueError("lds_discrepancies must be a nonnegative integer")
+    if type(search_limit) is not int or search_limit < 1:
+        raise ValueError("search_limit must be a positive integer")
+    budgets = tuple(budgets)
+    if not budgets:
+        raise ValueError("budgets must contain at least one DeviceBudget")
+    for budget in budgets:
+        if (type(budget) is not DeviceBudget or type(budget.memory_bytes) is not int or budget.memory_bytes <= 0
+                or isinstance(budget.utilization, bool) or not isinstance(budget.utilization, Real)
+                or not isfinite(budget.utilization) or budget.utilization <= 0):
+            raise ValueError("budgets must contain positive integer memory and finite positive utilization")
     problems = tuple(problems)
-    if any(not isinstance(problem, StreamCandidates) for problem in problems):
-        raise ValueError("problems must contain StreamCandidates")
+    for problem in problems:
+        if type(problem) is not StreamCandidates or not isinstance(problem.stream_id, str) or not problem.stream_id:
+            raise ValueError("problems must contain StreamCandidates with nonempty stream IDs")
+        if any(type(value) is not int or value < 1 for value in (problem.blocks, problem.chunks)):
+            raise ValueError("blocks and chunks must be positive integers")
+        if (isinstance(problem.slo_ms, bool) or not isinstance(problem.slo_ms, Real)
+                or not isfinite(problem.slo_ms) or problem.slo_ms <= 0):
+            raise ValueError("slo_ms must be a finite positive number")
+        _validate_candidates(problem.candidates, problem.blocks)
     if len({problem.stream_id for problem in problems}) != len(problems):
         raise ValueError("stream IDs must be unique")
     loads = [RankDemand(0, 0.0) for _ in budgets]
