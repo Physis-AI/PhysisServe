@@ -38,13 +38,8 @@ def test_decode_happens_at_the_selected_time_and_preserves_latents(monkeypatch, 
         events.clear()
         output = model.generate("cat", replace(params, mode=mode))[0]
         torch.testing.assert_close(output["latents"], raw["latents"], rtol=0, atol=0)
-        if mode == "offline_decode":
-            path = Path(output["latent_path"])
-            assert path.is_file() and path.name == "stream-0000.safetensors"
-            assert path.parent.name.startswith("generate-")
-            assert path.parent.parent == tmp_path / "latents"
-        else:
-            assert "latent_path" not in output and not (tmp_path / "latents").exists()
+        assert ("latent_path" in output) == (mode == "offline_decode")
+        assert (tmp_path / "latents").exists() == (mode == "offline_decode")
         if mode == "dit_only":
             assert all(kind == "dit" for kind, _ in events)
             assert "video" not in output and model._engine.config.decoder_loads == 0

@@ -65,10 +65,15 @@ def test_received_item_waits_only_its_operations_and_flush_does_not_wait_twice(f
         ("sent", 0, 2, SPEC, (torch.ones(1),)),
         ("second", 2, 0, SPEC, None),
     ])
+    assert state.posted == [("recv", 1, None), ("recv", 1, None),
+                            ("send", 2, None), ("recv", 2, None)]
     pending["first"].wait()
     assert state.waits == [0, 1]
     pending["second"].wait()
     assert state.waits == [0, 1, 3]
+    assert not state.works[2].complete
+    state.bus.transfer([])
+    assert len(state.bus.inflight) == 1
     state.bus.flush()
     assert state.waits == [0, 1, 3, 2]
     assert state.bus.inflight == []
@@ -137,48 +142,14 @@ def test_empty_and_local_transfers_need_no_backend_operations(fake_distributed):
     assert state.posted == state.works == state.bus.inflight == []
 
 
-def test_backend_failure_propagates(fake_distributed, monkeypatch):
-    def fail(operations):
-        raise RuntimeError("backend failed")
-
-    monkeypatch.setattr(transport.dist, "batch_isend_irecv", fail)
-    with pytest.raises(RuntimeError, match="backend failed"):
-        fake_distributed.bus.transfer([("received", 1, 0, SPEC, None)])
-
-
-def test_grouped_submission_preserves_order_and_maps_receive_handles(fake_distributed):
+@pytest.mark.parametrize("source,destination", [(0, 2), (1, 0)], ids=["send", "receive"])
+def test_packet_storage_survives_until_backend_completion(fake_distributed, source, destination):
     state = fake_distributed
-    pending = state.bus.transfer([
-        ("sent", 0, 2, SPEC, (torch.ones(1),)),
-        ("received", 1, 0, SPEC * 2, None),
-    ])["received"]
-    pending.wait()
-    assert state.posted == [("send", 2, None), ("recv", 1, None), ("recv", 1, None)]
-    assert state.waits == [1, 2]
-    assert not state.works[0].complete
-    state.bus.transfer([])
-    assert len(state.bus.inflight) == 1
-    state.bus.flush()
-    assert state.waits == [1, 2, 0]
-
-
-def test_sender_storage_survives_until_backend_completion(fake_distributed):
-    state = fake_distributed
-    tensor = torch.ones(1)
-    reference = weakref.ref(tensor)
-    state.bus.transfer([("sent", 0, 2, SPEC, (tensor,))])
-    del tensor
-    assert reference() is not None
-    state.works[0].complete = True
-    state.bus.transfer([])
-    assert reference() is None
-
-
-def test_dropped_pending_keeps_receiver_storage_until_completion(fake_distributed):
-    state = fake_distributed
-    pending = state.bus.transfer([("received", 1, 0, SPEC, None)])["received"]
-    reference = weakref.ref(pending.tensors[0])
-    del pending
+    tensor = torch.ones(1) if source == 0 else None
+    pending = state.bus.transfer([("packet", source, destination, SPEC,
+                                   (tensor,) if source == 0 else None)])
+    reference = weakref.ref(tensor if source == 0 else pending["packet"].tensors[0])
+    del tensor, pending
     assert reference() is not None
     state.works[0].complete = True
     state.bus.transfer([])

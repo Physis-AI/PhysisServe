@@ -1,8 +1,8 @@
 import pytest
 
-from physisserve.engine.strategies import StageEqual, VirtualRank
+from physisserve.engine.strategies import StageEqual
 from physisserve.engine.strategies.placement import (
-    Candidate, DeviceBudget, MappedLayout, RankDemand, StreamCandidates, plan_pool,
+    Candidate, DeviceBudget, RankDemand, StreamCandidates, plan_pool,
 )
 
 
@@ -72,24 +72,6 @@ def test_search_budget_exhaustion_does_not_poison_next_arrival():
     assert plan.loads == (RankDemand(10, 1),)
 
 
-@pytest.mark.parametrize("layout", [StageEqual(3), VirtualRank(3)])
-def test_mapping_preserves_batches_dependencies_and_admission_credits(layout):
-    mapped = MappedLayout(layout, (2, 0, 2), total_ranks=4)
-    original, actual = layout.schedule(3, 20), mapped.schedule(3, 20)
-    assert mapped.num_ranks(3) == 4
-    assert mapped.rank_blocks(1, 3) == mapped.rank_blocks(3, 3) == ()
-    assert mapped.rank_blocks(2, 3) == tuple(sorted(set(layout.rank_blocks(0, 3)) | set(layout.rank_blocks(2, 3))))
-    assert len(actual.tasks) == len(actual.task_of) == 20 * 4 * 3
-    assert actual.admission_window == original.admission_window
-    for source_tick, target_tick in zip(original.by_tick_batches, actual.by_tick_batches):
-        assert len(source_tick) == len(target_tick)
-        for source_batch, target_batch in zip(source_tick, target_tick):
-            assert [task.key for task in source_batch] == [task.key for task in target_batch]
-            for old, new in zip(source_batch, target_batch):
-                assert new.rank == (2, 0, 2)[old.rank]
-                assert old.tick == new.tick
-
-
 def test_no_arrivals_leave_pool_unused():
     empty = plan_pool([], [])
     assert empty.placements == empty.loads == ()
@@ -115,9 +97,11 @@ def test_candidate_names_do_not_restrict_search(name):
     assert plan.diagnostics["search"]["p"]["tried_candidates"] == (name, name)
 
 
-@pytest.mark.parametrize("ranks", [1, 2, 5])
-@pytest.mark.parametrize("discrepancies", [0, 1, 2])
-@pytest.mark.parametrize("search_limit", [0, 1, 7, 10000])
+@pytest.mark.parametrize("ranks,discrepancies,search_limit", [
+    (ranks, discrepancies, search_limit)
+    for ranks in [1, 2, 5] for search_limit in [0, 1, 7, 10000]
+    for discrepancies in ([0] if ranks == 1 or search_limit == 0 else [0, 1, 2])
+])
 def test_generated_placement_covers_arrivals_and_obeys_resource_and_search_budgets(
         ranks, discrepancies, search_limit):
     arrivals = [problem(str(index),

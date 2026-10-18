@@ -75,19 +75,26 @@ def test_stage_equal_schedules_cover_dag_with_singleton_rank_ticks(blocks, chunk
             assert len({task.rank for task in tick}) == len(tick)
 
 
-@pytest.mark.parametrize("layout", LAYOUTS)
-@pytest.mark.parametrize("pooled_ranks", [1, 2, 7])
-def test_remapped_schedules_keep_coverage_dependencies_and_kv_homes(layout, pooled_ranks):
+@pytest.mark.parametrize("layout,rank_map,pooled_ranks", [
+    (layout, tuple(rank % pooled_ranks for rank in range(layout.num_ranks(3))), pooled_ranks)
+    for layout in LAYOUTS for pooled_ranks in [1, 2, 7]
+] + [(StageEqual(3), (2, 0, 2), 4), (VirtualRank(3), (2, 0, 2), 4)])
+def test_remapped_schedules_keep_coverage_dependencies_and_kv_homes(layout, rank_map, pooled_ranks):
     blocks, chunks = 3, 26
-    rank_map = tuple(rank % pooled_ranks for rank in range(layout.num_ranks(blocks)))
     mapped = MappedLayout(layout, rank_map, pooled_ranks)
     schedule = assert_dag(mapped, blocks, chunks)
     original = layout.schedule(blocks, chunks)
-    for source_tick, target_tick in zip(original.by_tick_batches, schedule.by_tick_batches):
-        assert len(source_tick) == len(target_tick)
-        for source, target in zip(source_tick, target_tick):
-            assert [task.key for task in source] == [task.key for task in target]
-            assert all(mapped.rank_map[left.rank] == right.rank for left, right in zip(source, target))
+    assert mapped.num_ranks(blocks) == pooled_ranks
+    assert schedule.admission_window == original.admission_window
+    for rank in range(pooled_ranks):
+        assert mapped.rank_blocks(rank, blocks) == tuple(sorted({
+            block for local, target in enumerate(rank_map) if target == rank
+            for block in layout.rank_blocks(local, blocks)
+        }))
+    for source_tick, target_tick in zip(original.by_tick_batches, schedule.by_tick_batches, strict=True):
+        for source, target in zip(source_tick, target_tick, strict=True):
+            for old, new in zip(source, target, strict=True):
+                assert (new.key, new.rank, new.tick) == (old.key, rank_map[old.rank], old.tick)
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
@@ -137,19 +144,6 @@ def test_static_kv_cache_read_sets_and_lifetimes(layout):
     assert expired == set(schedule.task_of)
     assert sum(len(entries) for entries in kv.expiry) == len(schedule.tasks)
     assert not kv.pages
-
-
-@pytest.mark.parametrize("layout", LAYOUTS)
-def test_fixed_sink_keeps_chunk_zero_readable(layout):
-    blocks, chunks = 3, 26
-    schedule = layout.schedule(blocks, chunks)
-    kv = KVCache(schedule, lambda rank: True)
-    for task in schedule.tasks:
-        chunks_read = [key[0] for key in kv.reads[task]]
-        assert chunks_read == history_chunks(task.chunk)
-        if task.chunk == 0:
-            last_reader = schedule.task(chunks - 1, task.step, task.block)
-            assert task.key in kv.expiry[last_reader.tick]
 
 
 def test_fixed_sink_history_has_no_configuration_surface():

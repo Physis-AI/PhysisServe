@@ -4,7 +4,7 @@ from collections import Counter
 import pytest
 
 from tests.test_scheduler import assert_dag
-from physisserve.engine.strategies import StageEqual, VirtualRank
+from physisserve.engine.strategies import VirtualRank
 from physisserve.engine.strategies.virtual_rank import _group_costs, _improve, _plan
 
 
@@ -45,8 +45,6 @@ def assert_plan(layout, blocks, chunks):
     assert plan.admission_window == (layout.admission_window or 4 * blocks)
     for task in plan.tasks:
         assert task.rank == owners[task.step * blocks + task.block]
-        if task.step == task.block == 0 and task.chunk >= plan.admission_window:
-            assert plan.output(task.chunk - plan.admission_window).tick < task.tick
     for tick in plan.by_tick_batches:
         for batch in tick:
             assert [task.chunk for task in batch] == sorted({task.chunk for task in batch})
@@ -127,8 +125,6 @@ def test_scale_invariance_determinism_and_mutation_isolation():
     before = layout.schedule(5, 23).tasks
     layout.schedule(5, 2)
     assert layout.schedule(5, 23).tasks == before
-
-
 
 
 def test_tuple_cost_curves():

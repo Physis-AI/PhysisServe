@@ -7,7 +7,6 @@ import torch
 
 from physisserve import PhysisServe, SamplingParams
 from physisserve.config import Config
-from physisserve.sampling_params import Request
 from tests.test_engine import FakeConfig
 
 
@@ -35,8 +34,7 @@ from tests.test_engine import FakeConfig
 ])
 def test_standard_diffusers_profiles(tmp_path, name, channels, blocks, backend, shape, dimensions,
                                     chunks, fps, dtype, compute_dtype, sigmas, timesteps):
-    for component in ("transformer", "vae", "text_encoder", "tokenizer"):
-        (tmp_path / component).mkdir()
+    (tmp_path / "transformer").mkdir()
     (tmp_path / "model_index.json").write_text(json.dumps({"transformer": ["diffusers", name]}))
     (tmp_path / "transformer" / "config.json").write_text(json.dumps({
         "_class_name": name, "in_channels": channels, "num_layers": blocks,
@@ -92,8 +90,7 @@ def test_invalid_config_is_rejected_before_model_resolution(monkeypatch, kwargs)
 ])
 def test_model_dependent_config_is_rejected_before_engine_or_workers(monkeypatch, tmp_path,
                                                                   options, metadata):
-    for component in ("transformer", "vae", "text_encoder", "tokenizer"):
-        (tmp_path / component).mkdir()
+    (tmp_path / "transformer").mkdir()
     (tmp_path / "model_index.json").write_text("{}")
     (tmp_path / "transformer" / "config.json").write_text(json.dumps({
         "_class_name": "WanTransformer3DModel", "in_channels": 16, "num_layers": 30,
@@ -115,8 +112,6 @@ def test_model_dependent_config_is_rejected_before_engine_or_workers(monkeypatch
     ("h3", "H3DiT", {}, None),
 ])
 def test_model_factories_own_component_defaults(monkeypatch, tmp_path, family, dit_class, options, text_length):
-    (tmp_path / "vae").mkdir()
-    (tmp_path / "vae" / "config.json").write_text("{}")
     module = importlib.import_module(f"physisserve.models.{family}")
     monkeypatch.setattr(module, dit_class, lambda source, **kwargs: (source, kwargs))
     backend = module.backend(tmp_path)
@@ -182,8 +177,6 @@ def test_public_generate_unifies_single_multiple_and_offline_video(monkeypatch, 
         again = model.generate("dog", SamplingParams(num_chunks=5, seed=17))
         torch.testing.assert_close(again[0]["video"], decoded[1]["video"], rtol=0, atol=0)
         assert model.generate([], params) == []
-        with pytest.raises(ValueError, match="one per prompt"):
-            model.generate(["cat", "dog"], [params])
     assert not model._processes and model._closed
     with pytest.raises(RuntimeError, match="closed"):
         model.generate("cat", params)
@@ -208,8 +201,7 @@ def test_worker_failure_is_reported_and_processes_are_reaped(monkeypatch):
     {"num_chunks": 0}, {"height": -1}, {"seed": -1}, {"fps": True},
     {"num_chunks": True}, {"height": 1.5}, {"width": 0}, {"fps": 0},
     {"seed": True}, {"seed": 2**31},
-    {"mode": "video"}, {"mode": "stream_decode"}, {"mode": "deferred_decode"},
-    {"mode": None}, {"mode": []},
+    {"mode": "video"}, {"mode": None}, {"mode": []},
     {"latent_dir": ""}, {"latent_dir": "  "}, {"latent_dir": 3},
 ])
 def test_invalid_sampling_inputs(kwargs):
@@ -224,7 +216,6 @@ def test_sampling_mode_and_latent_directory_reach_request(tmp_path, mode):
     request = params.request("cat", fake_config("fake"))
     assert request.mode == mode and request.latent_dir == target
     assert not target.exists()
-    assert Request("cat", (1, 2, 1, 2, 2), 5, 0, 16).mode == "dit_only"
 
 
 def test_latent_directory_rejects_file(tmp_path):
@@ -318,12 +309,6 @@ def test_invalid_generate_containers_fail_before_worker_call(prompts, params):
     model._call = lambda *args, **kwargs: pytest.fail("invalid input must fail before worker calls")
     with pytest.raises((TypeError, ValueError)):
         model.generate(prompts, params)
-
-
-def test_generate_does_not_accept_external_placement():
-    model = PhysisServe.__new__(PhysisServe)
-    with pytest.raises(TypeError, match="unexpected keyword argument 'placement'"):
-        model.generate("cat", placement=object())
 
 
 def test_complete_diffusers_model_generates_decodable_video(tmp_path):

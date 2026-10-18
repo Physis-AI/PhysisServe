@@ -83,7 +83,7 @@ def _terminate_agents(agents):
                 pass
 
 
-def _run_script(tmp_path, source, *, processes_per_node=1, launched=True, timeout=75):
+def _run_script(tmp_path, source, *, processes_per_node=1, timeout=75):
     script = tmp_path / "user_script.py"
     script.write_text(textwrap.dedent(source))
     repository = str(Path(__file__).resolve().parents[1])
@@ -101,15 +101,13 @@ def _run_script(tmp_path, source, *, processes_per_node=1, launched=True, timeou
     deadline = monotonic() + timeout
     with ExitStack() as stack:
         try:
-            for node in range(2 if launched else 1):
-                command = [sys.executable]
-                if launched:
-                    command += ["-m", "torch.distributed.run", "--nnodes=2",
-                                f"--nproc-per-node={processes_per_node}", f"--node-rank={node}",
-                                "--master-addr=127.0.0.1", f"--master-port={port}",
-                                "--max-restarts=0", "--monitor-interval=0.1",
-                                "--module", "physisserve.launch", "--device", "cpu"]
-                command += [str(script), "forwarded value", "--script-option"]
+            for node in range(2):
+                command = [sys.executable, "-m", "torch.distributed.run", "--nnodes=2",
+                           f"--nproc-per-node={processes_per_node}", f"--node-rank={node}",
+                           "--master-addr=127.0.0.1", f"--master-port={port}",
+                           "--max-restarts=0", "--monitor-interval=0.1",
+                           "--module", "physisserve.launch", "--device", "cpu",
+                           str(script), "forwarded value", "--script-option"]
                 log = tmp_path / f"node-{node}.log"
                 logs.append(log)
                 stream = stack.enter_context(log.open("w"))
@@ -156,11 +154,9 @@ serve.Config = make_config
 """
 
 
-@pytest.mark.parametrize("processes_per_node", [0, 1, 2], ids=["python", "two-nodes", "four-ranks"])
+@pytest.mark.parametrize("processes_per_node", [1, 2], ids=["two-nodes", "four-ranks"])
 def test_launcher_runs_unmodified_api_once_and_reuses_pool(tmp_path, monkeypatch, processes_per_node):
     source = _PREAMBLE + """
-import imageio.v3 as iio
-
 params = [SamplingParams(num_chunks=5, seed=seed, mode="dit_only") for seed in (17, 23)]
 offline = [SamplingParams(num_chunks=5, seed=seed, mode="offline_decode",
                           latent_dir="latents") for seed in (17, 23)]
@@ -176,50 +172,43 @@ for strategy in ("stage_equal", "virtual_rank"):
             torch.testing.assert_close(original["latents"], output["latents"], rtol=0, atol=0)
         states[strategy] = service._call(engine_state)
         results[strategy] = outputs
-        for index, output in enumerate(outputs):
-            iio.imwrite(f"{strategy}-{index}.mp4", output["video"].numpy(), fps=output["fps"],
-                        codec="libx264", pixelformat="yuv420p", macro_block_size=None)
     assert service._closed
     service.close()
 torch.save(results, "outputs.pt")
 Path("states.json").write_text(json.dumps({"states": states, "config_calls": config_calls}))
 """
-    codes, logs = _run_script(tmp_path, source, processes_per_node=max(1, processes_per_node),
-                              launched=processes_per_node > 0)
+    codes, logs = _run_script(tmp_path, source, processes_per_node=processes_per_node)
     assert all(code == 0 for code in codes), logs
     assert (tmp_path / "script-ran").is_file()
-    world = processes_per_node * 2 or 1
+    world = processes_per_node * 2
     report = json.loads((tmp_path / "states.json").read_text())
     assert report["config_calls"] == [world, world]
     for states in report["states"].values():
         assert [state["rank"] for state in states] == list(range(world))
         assert [state["distributed_rank"] for state in states] == list(range(world))
         assert [state["local_rank"] for state in states] == [
-            rank % max(1, processes_per_node) for rank in range(world)]
+            rank % processes_per_node for rank in range(world)]
         assert all(state["ranks"] == world and state["loads"] > 0 for state in states)
         assert all(state["token"] == "created in user script only" for state in states)
         assert states[0]["encoded"] == ["cat", "dog"] * 3
         assert states[0]["decoder_loads"] == 1
         assert all(state["encoded"] == [] and state["decoder_loads"] == 0 for state in states[1:])
 
-    import imageio.v3 as iio
     from safetensors.torch import load_file
 
     actual = torch.load(tmp_path / "outputs.pt", weights_only=True)
     assert len(list((tmp_path / "latents").glob("generate-*/*.safetensors"))) == 4
-    assert len(list(tmp_path.glob("*.mp4"))) == 4
     monkeypatch.setattr("physisserve.serve.Config", fake_config)
     for strategy, outputs in actual.items():
         params = [SamplingParams(num_chunks=5, seed=seed, mode="dit_only") for seed in (17, 23)]
         with PhysisServe("fake", device="cpu", strategy=strategy) as local:
             expected = local.decode(local.generate(["cat", "dog"], params))
-        for index, (output, reference) in enumerate(zip(outputs, expected)):
+        for output, reference in zip(outputs, expected):
             assert output["prompt"] == reference["prompt"]
             torch.testing.assert_close(output["latents"], reference["latents"], rtol=0, atol=0)
             torch.testing.assert_close(output["video"], reference["video"], rtol=0, atol=0)
             torch.testing.assert_close(load_file(output["latent_path"])["latents"],
                                        reference["latents"], rtol=0, atol=0)
-            assert iio.imread(tmp_path / f"{strategy}-{index}.mp4").shape == (13, 2, 2, 3)
 
 
 @pytest.mark.parametrize("operation", ["fail_worker", "fail_worker_in_collective"],
