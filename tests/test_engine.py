@@ -7,10 +7,35 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from physisserve.engine.engine import Engine
+from physisserve.engine.kv_cache import BatchCache, Cache
 from physisserve.engine.sampler import Sampler
 from physisserve.engine.strategies import StageEqual, VirtualRank
 from physisserve.engine.strategies.placement import Candidate, PoolPlan, RankDemand, StreamPlacement
 from physisserve.sampling_params import Request
+
+
+@pytest.mark.parametrize("history_lengths", [(), (3, 1, 1)])
+def test_batch_cache_matches_serial_with_independent_pages(history_lengths):
+    batch, members = 2, 3
+    histories = [[tuple(torch.randn(batch, 2, tokens, 4) for _ in range(2))
+                  for tokens in history_lengths] for _ in range(members)]
+    originals = [[tuple(value.clone() for value in page) for page in history] for history in histories]
+    caches = [Cache(history) for history in histories]
+    key, value = (torch.randn(members * batch, 2, 1, 4) for _ in range(2))
+    with torch.inference_mode():
+        serial = [Cache(history)(k, v) for history, k, v in zip(histories, key.split(batch), value.split(batch))]
+        expected = tuple(torch.cat([page[i] for page in serial], dim=0) for i in (0, 1))
+        actual = BatchCache(caches, batch)(key, value)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for component, source in enumerate((key, value)):
+        pages = [cache.page[component] for cache in caches]
+        pointers = [page.untyped_storage().data_ptr() for page in pages]
+        assert len(set(pointers)) == members
+        assert source.untyped_storage().data_ptr() not in pointers
+        assert actual[component].untyped_storage().data_ptr() not in pointers
+        assert all(page.untyped_storage().nbytes() == page.numel() * page.element_size() for page in pages)
+        torch.testing.assert_close(torch.cat(pages), source, rtol=0, atol=0)
+    torch.testing.assert_close(histories, originals, rtol=0, atol=0)
 
 
 class FakeDiT:

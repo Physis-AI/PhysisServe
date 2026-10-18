@@ -15,8 +15,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from ..engine.chunks import Chunks
+from ..engine.kv_cache import BatchCache
 from .base import Backend, block_indices, load_selected_weights
-from .batching import BatchCache
 
 
 def backend(root, text_length=None, cache_text_kv=False) -> Backend:
