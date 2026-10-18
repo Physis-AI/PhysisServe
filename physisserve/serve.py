@@ -53,11 +53,10 @@ class PhysisServe:
 
     def __init__(self, model, *, pipeline_parallel_size=1, strategy="virtual_rank",
                  max_batch_size=4, device="cuda", encoder_device="cpu",
-                 rope_backend="native", batch_costs=None, admission_window=None):
+                 batch_costs=None, admission_window=None):
         self.config = Config(str(model), ranks=pipeline_parallel_size, strategy=strategy,
                              max_batch=max_batch_size, device=device, encoder_device=encoder_device,
-                             rope_backend=rope_backend, batch_costs=batch_costs,
-                             admission_window=admission_window)
+                             batch_costs=batch_costs, admission_window=admission_window)
         self._engine = None
         self._processes, self._connections = [], []
         self._rendezvous = None

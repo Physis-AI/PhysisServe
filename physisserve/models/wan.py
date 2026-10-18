@@ -17,16 +17,15 @@ from torch.nn import functional as F
 from ..engine.chunks import Chunks
 from .base import Backend, block_indices, load_selected_weights
 from .batching import BatchCache, validate_batch
-from .rope import select_rope, validate_rope_backend, validate_rope_device
 
 
-def backend(root, text_length=None, cache_text_kv=False, rope_backend="native") -> Backend:
+def backend(root, text_length=None, cache_text_kv=False) -> Backend:
     """Build a backend from a complete Diffusers package root.
 
     ``text_length`` defaults to Diffusers' WanPipeline maximum of 512.
     """
     root = Path(root)
-    return Backend(WanDiT(root / "transformer", cache_text_kv=cache_text_kv, rope_backend=rope_backend),
+    return Backend(WanDiT(root / "transformer", cache_text_kv=cache_text_kv),
                    WanEncoder(root, **({} if text_length is None else {"max_length": text_length})), WanDecoder(root))
 
 
@@ -89,9 +88,7 @@ class _Attention:
     the duration of one block call only, so no KV page outlives the plan through the processor.
     """
 
-    def __init__(self, rope_backend="native"):
-        self.rope_backend = validate_rope_backend(rope_backend)
-        self.rope = select_rope(rope_backend, "wan")
+    def __init__(self):
         self.cache = None
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, rotary_emb=None):
@@ -102,9 +99,8 @@ class _Attention:
         k = attn.norm_k(attn.to_k(hidden_states)).unflatten(2, (attn.heads, -1)).transpose(1, 2)
         v = attn.to_v(hidden_states).unflatten(2, (attn.heads, -1)).transpose(1, 2)
         k, v = self.cache(k, v)  # pages are [B, heads, tokens, head_dim], before RoPE
-        rope = self.rope or _rope
-        q = rope(q, *own).type_as(q).transpose(1, 2)
-        k = rope(k.transpose(1, 2), *window).type_as(k).transpose(1, 2)
+        q = _rope(q, *own).type_as(q).transpose(1, 2)
+        k = _rope(k.transpose(1, 2), *window).type_as(k).transpose(1, 2)
         hidden = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).flatten(2)
         return attn.to_out[1](attn.to_out[0](hidden))
 
@@ -115,17 +111,14 @@ class WanDiT:
     first_frames = 3
     sink_sigma = 0.0
 
-    def __init__(self, source, cache_text_kv=False, rope_backend="native"):
+    def __init__(self, source, cache_text_kv=False):
         from diffusers import WanTransformer3DModel
 
         self.source = Path(source)
-        self.rope_backend = validate_rope_backend(rope_backend)
         if type(cache_text_kv) is not bool:
             raise ValueError("cache_text_kv must be a boolean")
         self.cache_text_kv = cache_text_kv
         self.config = WanTransformer3DModel.load_config(self.source)
-        if rope_backend == "triton" and self.config["attention_head_dim"] != 128:
-            raise ValueError("Triton Wan RoPE requires attention_head_dim=128")
         if self.config["in_channels"] != self.config["out_channels"] or self.config.get("image_dim") is not None:
             raise ValueError("WanDiT supports prompt-only checkpoints with matching input/output channels; "
                              "image-prefix TI2V is not implemented")
@@ -136,7 +129,6 @@ class WanDiT:
         from diffusers import WanTransformer3DModel
         from diffusers.models.transformers.transformer_wan import WanRotaryPosEmbed
 
-        validate_rope_device(self.rope_backend, device, dtype)
         blocks = block_indices(blocks, self.num_blocks)
         cfg = self.config
         with torch.device("meta"):
@@ -154,7 +146,7 @@ class WanDiT:
         model.rope = WanRotaryPosEmbed(cfg["attention_head_dim"], cfg["patch_size"],
                                       cfg.get("rope_max_seq_len", 1024)).to(device)
         for block in model.blocks.values():
-            block.attn1.set_processor(_Attention(self.rope_backend))
+            block.attn1.set_processor(_Attention())
         self.model = model.eval().requires_grad_(False)
         self.device, self.dtype = torch.device(device), dtype
 

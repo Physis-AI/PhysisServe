@@ -95,7 +95,6 @@ def main():
     parser.add_argument("--width", type=int)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--prompt", default="A corgi running along a beach at sunset.")
-    parser.add_argument("--rope-backend", choices=("native", "triton"), default="native")
     args = parser.parse_args()
     if args.streams < 1 or args.repeats < 1 or args.warmups < 0 or not 0 <= args.skip_chunks < args.chunks - 1:
         parser.error("require positive streams/repeats, nonnegative warmups, and chunks > skip-chunks + 1")
@@ -112,7 +111,6 @@ def main():
     for strategy in ("stage_equal", "virtual_rank"):
         service = PhysisServe(args.model, pipeline_parallel_size=args.gpus, strategy=strategy,
                               max_batch_size=1 if strategy == "stage_equal" else args.max_batch_size,
-                              rope_backend=args.rope_backend,
                               batch_costs=batch_costs if strategy == "virtual_rank" else None)
         try:
             requests = service._requests(prompts, params)

@@ -18,17 +18,16 @@ from torch.nn import functional as F
 from ..engine.chunks import Chunks
 from .base import Backend, block_indices, drop_attributes, load_selected_weights
 from .batching import BatchCache, validate_batch
-from .rope import select_rope, validate_rope_backend, validate_rope_device
 
 
 
-def backend(root, text_length=None, rope_backend="native", compute_dtype=None) -> Backend:
+def backend(root, text_length=None, compute_dtype=None) -> Backend:
     """Build a backend from a complete Diffusers package root.
 
     ``text_length`` defaults to Diffusers' LTX2Pipeline maximum of 1024. ``compute_dtype``: see ``LTX2DiT``.
     """
     root = Path(root)
-    return Backend(LTX2DiT(root / "transformer", rope_backend=rope_backend, compute_dtype=compute_dtype),
+    return Backend(LTX2DiT(root / "transformer", compute_dtype=compute_dtype),
                    LTX2Encoder(root, **({} if text_length is None else {"max_length": text_length})), LTX2Decoder(root))
 
 
@@ -45,9 +44,7 @@ class _Attention:
     duration of one block call only.
     """
 
-    def __init__(self, rope_backend="native"):
-        self.rope_backend = validate_rope_backend(rope_backend)
-        self.rope = select_rope(rope_backend, "ltx")
+    def __init__(self):
         self.cache = self.rotary = None
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, query_rotary_emb=None,
@@ -56,9 +53,7 @@ class _Attention:
 
         if encoder_hidden_states is not None or attention_mask is not None:
             raise ValueError("this processor serves unmasked chunk self-attention only")
-        if self.rope is not None and attn.rope_type != "split":
-            raise ValueError("Triton LTX RoPE supports split rotary embeddings only")
-        rope = self.rope or (apply_split_rotary_emb if attn.rope_type == "split" else apply_interleaved_rotary_emb)
+        rope = apply_split_rotary_emb if attn.rope_type == "split" else apply_interleaved_rotary_emb
         own, window = self.rotary
         gate_logits = attn.to_gate_logits(hidden_states) if attn.to_gate_logits is not None else None
         query = attn.norm_q(attn.to_q(hidden_states))
@@ -97,7 +92,7 @@ class LTX2DiT:
     first_frames = 3
     sink_sigma = 0.0
 
-    def __init__(self, source, rope_backend="native", compute_dtype=None):
+    def __init__(self, source, compute_dtype=None):
         """``compute_dtype``: the weights' dtype and the autocast dtype when it differs from the engine's state
         dtype (``load``'s dtype). The packaged LTX-2.5 checkpoint keeps latents, noise and prompt context in
         float32 and runs bf16 weights under bf16 autocast: engine dtype float32 with
@@ -106,11 +101,7 @@ class LTX2DiT:
 
         self.compute_dtype = compute_dtype
         self.source = Path(source)
-        self.rope_backend = validate_rope_backend(rope_backend)
         self.config = LTX2VideoTransformer3DModel.load_config(self.source)
-        if rope_backend == "triton" and (self.config["attention_head_dim"] != 128
-                                        or self.config.get("rope_type", "interleaved") != "split"):
-            raise ValueError("Triton LTX RoPE requires split rotary embeddings and attention_head_dim=128")
         if self.config.get("use_prompt_embeddings", True):
             raise ValueError("LTX2DiT expects text conditions from the LTX text connectors (use_prompt_embeddings=False)")
         if self.config["patch_size"] != 1 or self.config["patch_size_t"] != 1:
@@ -122,7 +113,6 @@ class LTX2DiT:
         from diffusers import LTX2VideoTransformer3DModel
 
         state_dtype, dtype = dtype, self.compute_dtype or dtype  # dtype: weights and autocast from here on
-        validate_rope_device(self.rope_backend, device, dtype)
         blocks = block_indices(blocks, self.num_blocks)
         with torch.device("meta"):
             model = LTX2VideoTransformer3DModel.from_config(self.config)
@@ -138,7 +128,7 @@ class LTX2DiT:
                  for name, tensor in load_selected_weights(self.source, model.state_dict()).items()}
         model.load_state_dict(state, assign=True)
         for block in model.transformer_blocks.values():
-            block.attn1.set_processor(_Attention(self.rope_backend))
+            block.attn1.set_processor(_Attention())
         self.model = model.eval().requires_grad_(False)
         self.device, self.dtype, self.state_dtype = torch.device(device), dtype, state_dtype
 

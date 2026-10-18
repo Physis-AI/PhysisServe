@@ -23,7 +23,6 @@ class Config:
     max_batch: int = 4
     device: str = "cuda"
     encoder_device: str = "cpu"
-    rope_backend: str = "native"
     batch_costs: tuple[tuple[float, ...], ...] | None = None
     admission_window: int | None = None
     backend: str = field(init=False)
@@ -38,8 +37,6 @@ class Config:
             raise ValueError("strategy must be stage_equal or virtual_rank")
         if type(self.max_batch) is not int or not 1 <= self.max_batch <= 4:
             raise ValueError("max_batch_size must be between 1 and 4")
-        if self.rope_backend not in ("native", "triton"):
-            raise ValueError("rope_backend must be native or triton")
         if self.device not in ("cpu", "cuda") or self.encoder_device not in ("cpu", "cuda"):
             raise ValueError("device and encoder_device must be cpu or cuda")
         if self.strategy == "stage_equal":
@@ -102,7 +99,7 @@ class Config:
     def make_backend(self, root=None):
         import torch
 
-        options = dict(text_length=self.text_length, rope_backend=self.rope_backend)
+        options = dict(text_length=self.text_length)
         if self.backend == "wan":
             options["cache_text_kv"] = self.cache_text_kv
         if self.compute_dtype is not None:

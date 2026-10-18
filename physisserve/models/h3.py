@@ -18,14 +18,13 @@ from torch.nn import functional as F
 
 from .base import Backend, block_indices, drop_attributes, load_selected_weights
 from .batching import BatchCache, validate_batch
-from .rope import select_rope, validate_rope_backend, validate_rope_device
 
 
-def backend(root, text_length=None, rope_backend="native") -> Backend:
+def backend(root, text_length=None) -> Backend:
     """Build the video-only H3 components from an official Diffusers layout."""
     root = Path(root)
     return Backend(
-        H3DiT(root / "transformer", rope_backend=rope_backend),
+        H3DiT(root / "transformer"),
         H3Encoder(root, max_length=text_length),
         H3LatentDecoder(root),
     )
@@ -89,9 +88,7 @@ class _Attention:
     history is shifted by whole five-frame periods to preserve H3's clock phase.
     """
 
-    def __init__(self, rope_backend="native"):
-        self.rope_backend = validate_rope_backend(rope_backend)
-        self.rope = select_rope(rope_backend, "h3")
+    def __init__(self):
         self.cache = self.key_rotary = None
         self.text_tokens = 0
         self.batch_shape = None
@@ -102,7 +99,6 @@ class _Attention:
         if self.cache is None or self.key_rotary is None or rotary_emb is None:
             raise RuntimeError("H3 attention processor was called outside H3DiT.block")
         from diffusers.models.transformers.transformer_minimax_h3 import _apply_rotary_emb
-        rope = self.rope or _apply_rotary_emb
 
         original_shape = hidden_states.shape
         if self.batch_shape is not None:
@@ -112,13 +108,13 @@ class _Attention:
 
         def rotate(tensor, tables):
             if self.batch_shape is None:
-                return rope(tensor, *tables)
-            # H3's native and Triton RoPE accept shared [tokens, rotary] tables.
+                return _apply_rotary_emb(tensor, *tables)
+            # H3's RoPE accepts shared [tokens, rotary] tables.
             # Packing only this elementwise operation supports different tables
             # per member without mixing their attention documents.
             batch, tokens, heads, width = tensor.shape
             packed = tensor.reshape(1, batch * tokens, heads, width)
-            return rope(packed, *tables).reshape(batch, tokens, heads, width)
+            return _apply_rotary_emb(packed, *tables).reshape(batch, tokens, heads, width)
 
         if attn.fused_projections:
             query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
@@ -154,15 +150,12 @@ class H3DiT:
     first_frames = 1
     sink_sigma = 0.001
 
-    def __init__(self, source, rope_backend="native"):
+    def __init__(self, source):
         from diffusers import MiniMaxH3Transformer3DModel
 
         self.source = Path(source)
-        self.rope_backend = validate_rope_backend(rope_backend)
         self.config = MiniMaxH3Transformer3DModel.load_config(self.source)
         self.config = {key: value for key, value in self.config.items() if not key.startswith("_")}
-        if rope_backend == "triton" and self.config["attention_head_dim"] != 128:
-            raise ValueError("Triton H3 RoPE requires attention_head_dim=128")
         if tuple(self.config["patch_size"])[0] != 1:
             raise ValueError("H3 chunk inference requires temporal patch size 1")
         self.num_blocks = self.config["num_layers"]
@@ -172,7 +165,6 @@ class H3DiT:
         from diffusers import MiniMaxH3Transformer3DModel
         from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3RotaryPosEmbed
 
-        validate_rope_device(self.rope_backend, device, dtype)
         blocks = block_indices(blocks, self.num_blocks)
         with torch.device("meta"):
             model = MiniMaxH3Transformer3DModel.from_config(self.config)
@@ -194,7 +186,7 @@ class H3DiT:
             self.config["rope_freq_dim"], self.config["rope_theta"]
         ).to(device)
         for block in model.transformer_blocks.values():
-            block.attn.set_processor(_Attention(self.rope_backend))
+            block.attn.set_processor(_Attention())
         self.model = model.eval().requires_grad_(False)
         self.device, self.dtype = torch.device(device), dtype
 
