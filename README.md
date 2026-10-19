@@ -8,7 +8,7 @@
 
 A lightweight inference engine for autoregressive video diffusion.
 
-[Blog](https://physis-ai.com/blog/physisserve/en) · [Models](#supported-models) · [Quick Start](#quick-start) · [Roadmap](#roadmap)
+[Blog](https://physis-ai.com/blog/physisserve/en) · [Models](https://huggingface.co/collections/Physis-AI/physisserve-dev-model) · [Quick Start](#quick-start) · [Roadmap](#roadmap)
 
 PhysisServe schedules work at the granularity of a Transformer block and a denoising step, overlapping chunks across GPUs. One Python API handles both single-stream and concurrent generation.
 
