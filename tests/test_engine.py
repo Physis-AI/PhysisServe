@@ -1,5 +1,6 @@
 from datetime import timedelta
 from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -190,6 +191,52 @@ def test_interleaved_streams_equal_independent_requests_and_reuse_weights(strate
         assert torch.equal(results[index]["latents"], swapped[1 - index]["latents"])
 
 
+@pytest.mark.parametrize("strategy", ["stage_equal", "virtual_rank"])
+@pytest.mark.parametrize("first_frames", [1, 3])
+def test_timing_run_delivers_without_retaining_outputs_and_preserves_next_run(strategy, first_frames, monkeypatch):
+    config = FakeConfig(strategy, first_frames)
+    engine = Engine(config)
+    prompts, params = inputs()
+    engine.prepare(prompts, params)
+    expected = engine.run()
+    produced, delivered, references = [], [], {}
+
+    def output(index, chunk, latent):
+        assert (index, chunk) in produced
+        delivered.append((index, chunk))
+        start = 0 if chunk == 0 else first_frames + chunk - 1
+        stop = first_frames if chunk == 0 else start + 1
+        torch.testing.assert_close(latent, expected[index]["latents"][:, :, start:stop], rtol=0, atol=0)
+        if chunk > 1:
+            assert references[index, 0]() is None
+        references[index, chunk] = weakref.ref(latent)
+
+    concatenate = torch.cat
+
+    def no_video_concat(tensors, *args, **kwargs):
+        assert tensors[0].ndim != 5, "timing runs must not concatenate completed latents"
+        return concatenate(tensors, *args, **kwargs)
+
+    def no_cpu_copy(*args, **kwargs):
+        pytest.fail("timing runs must not materialize CPU results")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "cat", no_video_concat)
+        patch.setattr(torch.Tensor, "cpu", no_cpu_copy)
+        result = engine.run(on_latent=lambda index, chunk, latent: produced.append((index, chunk)),
+                            on_output=output, return_outputs=False)
+    assert result is None
+    assert produced == delivered
+    assert all(reference() is None for reference in references.values())
+    for index, param in enumerate(params):
+        assert [chunk for stream, chunk in delivered if stream == index] == list(range(param.num_chunks))
+    assert delivered.index((1, 0)) < delivered.index((0, params[0].num_chunks - 1))
+    again = engine.run()
+    assert len(config.loaded) == 2 and config.encoder_loads == 1 and config.decoder_loads == 0
+    for output, reference in zip(again, expected):
+        torch.testing.assert_close(output["latents"], reference["latents"], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("sequence", [False, True])
 def test_offline_decode_resets_each_video_and_accounts_for_first_chunk(sequence, monkeypatch):
     config = FakeConfig(sequence=sequence)
@@ -303,7 +350,14 @@ def distributed_worker(rank, rendezvous):
             assert all(not dit.loaded for dit in config.loaded)
         else:
             assert results is None
-        engine.run()
+        produced, delivered = [], []
+        assert engine.run(on_latent=lambda index, chunk, latent: produced.append((index, chunk)),
+                          on_output=lambda index, chunk, latent: delivered.append((index, chunk)),
+                          return_outputs=False) is None
+        observed = delivered if rank == 0 else produced
+        assert not (produced if rank == 0 else delivered)
+        for index, param in enumerate(params):
+            assert [chunk for stream, chunk in observed if stream == index] == list(range(param.num_chunks))
     finally:
         dist.destroy_process_group()
 

@@ -98,7 +98,7 @@ class Engine:
         self.sessions = tuple(sessions)
         self._barrier()
 
-    def run(self, on_latent=None, on_batch=None):
+    def run(self, on_latent=None, on_batch=None, on_output=None, return_outputs=True):
         """Interleave one tick per active stream; return CPU latents on rank zero.
 
         Callbacks receive the input index followed by the runner's chunk/latent or
@@ -106,6 +106,8 @@ class Engine:
         streams finish. Other modes buffer completed latents in CPU memory;
         online_decode additionally decodes each chunk before advancing this rank.
         Calling run again reuses weights and starts fresh KV state and seeded noise.
+        on_output observes delivered latents on rank zero, after output transfers.
+        Benchmarks can set return_outputs=False to avoid retaining the video.
         """
         active = []
         chunks = {index: [] for index, *_ in self.sessions}
@@ -137,6 +139,10 @@ class Engine:
                         active.remove(session)
                         continue
                     for chunk, latent in outputs:
+                        if on_output is not None:
+                            on_output(index, chunk, latent)
+                        if not return_outputs:
+                            continue
                         params = self.sampling_params[index]
                         if index in decoders:
                             decoder = decoders[index]
@@ -147,7 +153,7 @@ class Engine:
                             latent = latent.cpu()
                         chunks[index].append((chunk, latent))
             self._barrier()
-            if not self.is_output:
+            if not self.is_output or not return_outputs:
                 return None
             results, directories = [], {}
             for index, (prompt, params) in enumerate(zip(self.prompts, self.sampling_params)):

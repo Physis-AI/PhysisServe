@@ -32,11 +32,11 @@ def engine_state(engine):
     }
 
 
-def cpu_measure(engine, prompts, params, warmups, repeats):
+def cpu_measure(engine, prompts, params, warmups, repeats, candidates=None, budgets=()):
     """Use wall time for the CPU fixture while exercising bench's real engines."""
-    engine.prepare(prompts, params)
+    engine.prepare(prompts, params, candidates, budgets)
     for _ in range(warmups):
-        engine.run()
+        engine.run(return_outputs=False)
     measurements = []
     for _ in range(repeats):
         engine._barrier()
@@ -45,9 +45,25 @@ def cpu_measure(engine, prompts, params, warmups, repeats):
         def completed(index, chunk, latent):
             times.setdefault(index, []).append((chunk, (monotonic() - start) * 1000))
 
-        engine.run(on_latent=completed, on_batch=lambda index, rank, size: batches.append(size))
+        assert engine.run(on_output=completed, on_batch=lambda index, rank, size: batches.append(size),
+                          return_outputs=False) is None
         measurements.append({"times": times, "max_batch": max(batches, default=0)})
     return measurements
+
+
+def cpu_devices(engine):
+    return {"rank": engine.rank, "name": "CPU fixture", "free_bytes": 1 << 30, "total_bytes": 1 << 30}
+
+
+def cpu_calibrate(engine, params, prompt, max_batch, warmups=3, samples=12):
+    return {"rank": engine.rank, "error": None,
+            "samples_ms": {f"{block}:{size}": [float(size)] * samples
+                           for block in range(engine.rank, engine.config.num_blocks, engine.config.ranks)
+                           for size in range(1, max_batch + 1)}}
+
+
+def cpu_prepare_candidate(engine, prompts, params, candidates=None, budgets=(), memory_margin=1.2, memory_budgets=None):
+    return {"rank": engine.rank, "status": "ready"}
 
 
 def fail_worker_in_collective(engine):
@@ -247,25 +263,49 @@ runpy.run_path({example!r}, run_name="__main__")
     assert all(load_file(str(path))["latents"].shape == (1, 2, 7, 2, 2) for path in latents)
 
 
-def test_original_benchmark_reopens_services_and_gathers_worker_measurements(tmp_path):
+def test_benchmark_reuses_pool_and_gathers_profile_and_delivery_measurements(tmp_path):
     source = _PREAMBLE + """
 import bench
-import runpy
-from tests.test_launch import cpu_measure
+from tests.test_launch import cpu_measure, cpu_devices, cpu_calibrate, cpu_prepare_candidate
 
-# The benchmark remains CUDA-only in production; replace its timer for this CPU fixture.
+# Only GPU measurement/metadata operations are replaced; dispatch, inference,
+# policy switching, result aggregation and JSON recording remain real.
 bench.torch.cuda.is_available = lambda: True
 bench.measure = cpu_measure
+bench.devices = cpu_devices
+bench.calibrate = cpu_calibrate
+bench.prepare_candidate = cpu_prepare_candidate
+bench.identity = lambda config, params, hardware: {"fixture": "cpu", "ranks": config.ranks}
 sys.argv = ["bench.py", "fake", "--streams", "2",
-            "--warmups", "1", "--repeats", "2"]
-runpy.run_path(bench.__file__, run_name="__main__")
-assert config_calls == [2, 2]
+            "--warmups", "1", "--repeats", "2", "--output", "benchmark"]
+bench.main()
+assert config_calls == [2]
 """
     codes, logs = _run_script(tmp_path, source)
     assert all(code == 0 for code in codes), logs
-    assert "stage_equal   completion" in logs
-    assert "virtual_rank  completion" in logs
-    assert "VirtualRank speedup:" in logs
+    report = json.loads((tmp_path / "benchmark/report.json").read_text())
+    assert report["status"] in ("completed", "incomplete") and "error" not in report
+    assert report["identity"] == {"fixture": "cpu", "ranks": 2}
+    assert [row["rank"] for row in report["hardware"]] == [0, 1]
+    calibration = json.loads((tmp_path / "benchmark/calibration.json").read_text())
+    assert [row["rank"] for row in calibration] == [0, 1]
+    assert [set(row["samples_ms"]) for row in calibration] == [
+        {f"{block}:{size}" for size in range(1, 5)} for block in range(2)]
+    assert json.loads((tmp_path / "benchmark/costs.json").read_text()) == [[1, 2, 3, 4]] * 2
+    assert set(report["comparison"]) == {"stage_equal", "virtual_rank"}
+    for method in report["comparison"]:
+        point = json.loads((tmp_path / "benchmark" / f"{method}.json").read_text())
+        assert [row["rank"] for row in point["preflight"]] == [0, 1]
+        assert point["attempts"]
+        for attempt in point["attempts"]:
+            output_rank, worker_rank = attempt["raw"]
+            assert len(output_rank) == len(worker_rank) == 2
+            assert all(not trial["times"] for trial in worker_rank)
+            for trial in output_rank:
+                assert set(trial["times"]) == {"0", "1"}
+                for index, count in enumerate(attempt["chunks"]):
+                    assert [chunk for chunk, _ in trial["times"][str(index)]] == list(range(count))
+    assert "Reports:" in logs
     assert not (tmp_path / "latents").exists()
 
 

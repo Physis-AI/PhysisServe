@@ -95,12 +95,17 @@ Set `NODE_RANK` to `0` or `1`. All nodes need the package, script, and access to
 
 ## Benchmark
 
-[bench.py](bench.py) compares StageEqual and VirtualRank over the steady portion of a long `dit_only` run:
+[bench.py](bench.py) automatically profiles block costs and compares StageEqual and VirtualRank over long `dit_only` runs. Add `--slo-ms` to profile candidate memory/compute demands and search the largest verified stream count within `--max-streams`:
 
 ```bash
 python bench.py Physis-AI/physisserve-wan2p1_1p3b-same_step-sdv2 \
   --gpus 2 --streams 2
+
+python bench.py Physis-AI/physisserve-wan2p1_1p3b-same_step-sdv2 \
+  --gpus 2 --slo-ms 1600 --max-streams 64
 ```
+
+Raw measurements and placement decisions are saved under `bench-results/`; use `--resume PATH` with the same arguments after interruption. SLO qualification includes bootstrap gaps; resource estimates alone never qualify a stream count. Search limits and unverified points are reported explicitly.
 
 ## Roadmap
 
