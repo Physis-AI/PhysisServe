@@ -256,7 +256,7 @@ from tests.test_launch import cpu_measure
 # The benchmark remains CUDA-only in production; replace its timer for this CPU fixture.
 bench.torch.cuda.is_available = lambda: True
 bench.measure = cpu_measure
-sys.argv = ["bench.py", "fake", "--streams", "2", "--chunks", "5", "--skip-chunks", "0",
+sys.argv = ["bench.py", "fake", "--streams", "2",
             "--warmups", "1", "--repeats", "2"]
 runpy.run_path(bench.__file__, run_name="__main__")
 assert config_calls == [2, 2]
