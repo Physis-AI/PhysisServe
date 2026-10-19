@@ -1,4 +1,4 @@
-"""Profile and compare StageEqual/VirtualRank; --slo-ms searches pool capacity."""
+"""Profile and compare StageEqual/VirtualRank capacity; --streams selects a fixed-count comparison."""
 import argparse
 from bisect import bisect_left, bisect_right
 import gc
@@ -565,9 +565,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", help="Diffusers directory or Hugging Face repository")
     parser.add_argument("--gpus", type=int, default=1)
-    parser.add_argument("--streams", type=int, default=1, help="fixed-count performance comparison")
-    parser.add_argument("--slo-ms", type=float, help="search capacity under this delivery-gap deadline, including bootstrap")
-    parser.add_argument("--max-streams", type=int, default=64, help="capacity search ceiling, not a claimed maximum")
+    parser.add_argument("--streams", type=int, help="run a fixed-count comparison instead of capacity search")
+    parser.add_argument("--slo-ms", type=float, default=1600, help="delivery-gap deadline in ms, including bootstrap (default: 1600)")
+    parser.add_argument("--max-streams", type=int, default=64, help="capacity search ceiling, not a claimed maximum (default: 64)")
     parser.add_argument("--chunks", type=int, help="initial chunks per stream; default/minimum: 1 + 16 * block count")
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
@@ -580,8 +580,9 @@ def main():
     outputs.add_argument("--output", type=Path, help="new report directory (default: a fresh directory under bench-results)")
     outputs.add_argument("--resume", type=Path, help="reuse completed measurements from an identical interrupted run")
     args = parser.parse_args()
-    if (min(args.streams, args.max_streams, args.repeats) < 1 or args.warmups < 1
-            or (args.slo_ms is not None and (not isfinite(args.slo_ms) or args.slo_ms <= 0))):
+    if (min(args.max_streams, args.repeats, args.warmups) < 1
+            or (args.streams is not None and args.streams < 1)
+            or not isfinite(args.slo_ms) or args.slo_ms <= 0):
         parser.error("require positive streams, repeats, warmups and finite positive SLO")
     if not torch.cuda.is_available():
         parser.error("CUDA is required for this benchmark")
@@ -639,7 +640,7 @@ def main():
             save(calibration, raw)
         costs = cost_table(raw, config.num_blocks, args.max_batch_size)
         save(directory / "costs.json", costs)
-        if args.slo_ms is not None:
+        if args.streams is None:
             profiles = candidate_profiles(service, params, budgets, costs, args, directory, trim)
             report["capacity"] = search_capacity(service, params, budgets, profiles, costs, args, directory, trim)
         else:
@@ -657,7 +658,7 @@ def main():
                 se, vr = comparisons["stage_equal"], comparisons["virtual_rank"]
                 report["steady_speedup"] = vr["steady_chunks_per_second"] / se["steady_chunks_per_second"]
                 print(f"VirtualRank steady throughput: {report['steady_speedup']:.3f}x", flush=True)
-        if args.slo_ms is not None:
+        if args.streams is None:
             uncertain = any(item["unverified_profiles"] or item["unverified_points"] for item in report["capacity"].values())
             report["status"] = "partial_search" if uncertain else "bounded_search_completed"
         else:

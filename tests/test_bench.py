@@ -15,6 +15,38 @@ def row(*times, batch=1):
             "max_batch": batch}
 
 
+def test_default_slo_and_stream_ceiling_select_capacity_search(monkeypatch, tmp_path):
+    service = SimpleNamespace(config=fake_config("fake"))
+    calls, closed = [], []
+
+    def call(operation, *args):
+        if operation is bench.devices:
+            return [{"rank": 0, "name": "fake", "free_bytes": 1000, "total_bytes": 1000}]
+        assert operation is bench.calibrate
+        return [{"error": None, "samples_ms": {f"{block}:{size}": [float(size)]
+                                                 for block in range(2) for size in range(1, 5)}}]
+
+    def search(service, params, budgets, profiles, costs, args, directory, trim):
+        assert (args.streams, args.slo_ms, args.max_streams) == (None, 1600, 64)
+        calls.append("search")
+        return {method: {"unverified_profiles": [], "unverified_points": []}
+                for method in ("stage_equal", "virtual_rank")}
+
+    service._call, service.close = call, lambda: closed.append(True)
+    monkeypatch.setattr(bench, "PhysisServe", lambda *args, **kwargs: service)
+    monkeypatch.setattr(bench.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(bench, "identity", lambda *args: {})
+    monkeypatch.setattr(bench, "candidate_profiles", lambda *args: [])
+    monkeypatch.setattr(bench, "search_capacity", search)
+    monkeypatch.setattr("sys.argv", ["bench.py", "fake", "--output", str(tmp_path / "default")])
+    bench.main()
+    report = json.loads((tmp_path / "default" / "report.json").read_text())
+    assert (report["settings"]["streams"], report["settings"]["slo_ms"],
+            report["settings"]["max_streams"]) == (None, 1600, 64)
+    assert report["status"] == "bounded_search_completed" and "comparison" not in report
+    assert calls == ["search"] and closed == [True]
+
+
 @pytest.mark.parametrize("blocks,chunks", [(30, 481), (40, 641), (48, 769), (50, 801)])
 def test_default_long_run_profiles_every_layout_and_resumes_without_remeasurement(monkeypatch, tmp_path, blocks, chunks):
     calls, closed = [], []
@@ -177,6 +209,8 @@ def test_fixed_comparison_calibrates_and_keeps_each_stream_on_the_full_pool(monk
     assert [args[0] for name, args in calls if name == "configure"] == ["stage_equal", "virtual_rank"]
     report = json.loads((output / "report.json").read_text())
     assert report["status"] == "completed" and report["steady_speedup"] == 1
+    assert report["settings"]["slo_ms"] == 1600 and report["settings"]["max_streams"] == 64
+    assert "capacity" not in report
     assert all(point["plan"] == "same full-pool layout per stream" for point in report["comparison"].values())
     assert closed == [True]
 
