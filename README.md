@@ -31,7 +31,9 @@ pip install -e .
 
 ## Supported Models
 
-| Model | Checkpoint |
+The following model releases use Diffusers format and support same-step noisy-KV inference.
+
+| Model | Hugging Face Repository |
 | --- | --- |
 | MiniMax H3 33B | [physisserve-minimaxh3_33b-same_step-ls-dev](https://huggingface.co/Physis-AI/physisserve-minimaxh3_33b-same_step-ls-dev) |
 | LTX-2.5 22B | [physisserve-ltx2p5_22b-same_step-ls-dev](https://huggingface.co/Physis-AI/physisserve-ltx2p5_22b-same_step-ls-dev) |
@@ -39,10 +41,10 @@ pip install -e .
 | Wan2.1 14B | [physisserve-wan2p1_14b-same_step-sdv2](https://huggingface.co/Physis-AI/physisserve-wan2p1_14b-same_step-sdv2) |
 | Wan2.1 1.3B | [physisserve-wan2p1_1p3b-same_step-sdv2](https://huggingface.co/Physis-AI/physisserve-wan2p1_1p3b-same_step-sdv2) |
 
-- `sdv2`: StreamDiffusionV2 checkpoints converted to Diffusers format.
-- `ls-dev`: checkpoints trained by Physis-AI and released in Diffusers format.
+- `sdv2`: weights from StreamDiffusionV2, converted to Diffusers format.
+- `ls-dev`: weights trained and released by Physis-AI.
 
-Use these same-step checkpoints rather than the original base-model weights. GPU memory requirements depend on the model, resolution, and number of concurrent streams.
+Use the model weights linked above rather than the original base-model weights. GPU memory usage depends on the model, resolution, and number of concurrent streams.
 
 ## Quick Start
 
@@ -115,8 +117,21 @@ Raw measurements and placement decisions are saved under `bench-results/`; use `
 
 ## Roadmap
 
-- [ ] Gradually evolve the engine into a video generation serving system.
-- [ ] Open-source more scheduling algorithms.
+- [ ] **Serving engine**
+
+  - [ ] ACWM and WAM support with interactive streaming.
+  - [ ] Dynamic request arrival, completion, and cancellation.
+  - [ ] Cross-stream block-weight sharing with independent KV caches.
+
+- [ ] **Scheduling algorithms**
+
+  - [ ] Admission and placement with per-stream priorities and SLOs.
+  - [ ] Cross-stream batching of compatible same-block tasks.
+  - [ ] Specialized inference and scheduling for real-time, multi-turn online interaction.
+
+- [ ] **Post-training**
+
+  - [ ] Bidirectional-to-autoregressive post-training for same-step noisy-KV inference.
 
 ## Contributing
 
