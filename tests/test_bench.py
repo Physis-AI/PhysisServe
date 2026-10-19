@@ -6,7 +6,7 @@ import pytest
 import bench
 from bench import summarize
 from physisserve import PhysisServe
-from physisserve.engine.strategies.placement import DeviceBudget
+from physisserve.engine.strategies.placement import DeviceBudget, plan_pool
 from tests.test_api import fake_config
 
 
@@ -98,11 +98,12 @@ def test_default_long_run_profiles_every_layout_and_resumes_without_remeasuremen
     assert [candidate.name for candidate in profiles] == ["stage_equal-r2", "virtual_rank-r2",
                                                          "stage_equal-r1", "virtual_rank-r1"]
     assert sum(name == "calibrate" for name, _ in calls) == 1
-    assert sum(name == "measure" for name, _ in calls) == 4
+    assert sum(name == "measure" for name, _ in calls) == 6
     report = json.loads((output / "report.json").read_text())
     assert report["status"] == "bounded_search_completed"
     assert report["protocol"]["initial_chunks"] == chunks
     assert report["protocol"]["profile_ranks"] == [1, 2]
+    assert set(report["capacity"]) == {"stage_equal_exclusive", "stage_equal", "virtual_rank"}
     assert all(value["stop_reason"] == "stream_limit" for value in report["capacity"].values())
     calls.clear()
     monkeypatch.setattr("sys.argv", arguments + ["--resume", str(output)])
@@ -290,9 +291,13 @@ def test_capacity_search_does_not_assume_slo_passes_are_monotonic(monkeypatch, t
                 "steady_slo_pass": True}
 
     monkeypatch.setattr(bench, "run_point", point)
-    args = SimpleNamespace(max_batch_size=4, max_streams=3, slo_ms=100)
-    result = bench.search_capacity(None, None, [], [], [], args, tmp_path, trim=2)
-    assert [count for _, count in calls] == [1, 2, 3, 1, 2, 3]
+    args = SimpleNamespace(max_batch_size=4, max_streams=3, slo_ms=100, seed=0)
+    profiles = [profile(method, ranks) for method in ("stage_equal", "virtual_rank") for ranks in range(1, 4)]
+    result = bench.search_capacity(None, None, [DeviceBudget(1000)] * 3, profiles,
+                                   [[1, 2, 3, 4]], args, tmp_path, trim=2)
+    assert [count for _, count in calls] == [1] * 3 + [2] * 3 + [3] * 3
+    assert [name for name, _ in calls[:6]] == ["virtual_rank-streams1", "stage_equal-streams1",
+        "stage_equal_exclusive-streams1", "stage_equal_exclusive-streams2", "stage_equal-streams2", "virtual_rank-streams2"]
     for record in result.values():
         assert record["largest_verified_streams"] == 2
         assert record["largest_steady_only_streams"] == 3
@@ -301,15 +306,72 @@ def test_capacity_search_does_not_assume_slo_passes_are_monotonic(monkeypatch, t
 
 def test_placement_failure_is_unknown_not_a_measured_slo_failure(monkeypatch, tmp_path):
     service = SimpleNamespace(_call=lambda *args: pytest.fail("a rejected placement must not execute"))
-    args = SimpleNamespace(max_batch_size=4, max_streams=3, slo_ms=100)
+    args = SimpleNamespace(max_batch_size=4, max_streams=3, slo_ms=100, seed=0)
     result = bench.search_capacity(service, None, [DeviceBudget(100)], [], [], args, tmp_path, trim=2)
-    for record in result.values():
+    for method in ("stage_equal", "virtual_rank"):
+        record = result[method]
         assert record["stop_reason"] == "not_admitted"
         assert record["largest_verified_streams"] == 0
         point, = record["points"]
         assert point["status"] == "not_admitted" and point["streams"] == 1
         assert "strict_slo_pass" not in point
         assert point["plan"]["diagnostics"]["global_slo_verified"] is False
+    exclusive = result["stage_equal_exclusive"]
+    assert [point["status"] for point in exclusive["points"]] == ["unverified_profile", "not_admitted"]
+    assert exclusive["unverified_points"] == [1]
+    assert exclusive["stop_reason"] == "not_admitted"
+    assert "at least one GPU" in exclusive["points"][1]["reason"]
+
+
+def profile(method, ranks):
+    return {"name": f"{method}-r{ranks}", "method": method, "ranks": ranks, "status": "measured",
+            "demands": [{"peak_bytes": 100, "compute_ms_per_chunk": 20}] * ranks,
+            "summary": {"max_gap_ms": 200}}
+
+
+@pytest.mark.parametrize("ranks,count,sizes", [(7, 3, [3, 2, 2]), (8, 2, [4, 4]), (3, 3, [1, 1, 1])])
+def test_equal_split_uses_all_gpus_disjointly_without_isolated_slo_screen(ranks, count, sizes):
+    profiles = [profile("stage_equal", size) for size in set(sizes)]
+    problems = bench.equal_problems(profiles, ranks, count, slo_ms=100, idle_bytes=20)
+    assert [len(problem.candidates[0].demands) for problem in problems] == sizes
+    assert all(candidate.max_gap_ms == 0 for problem in problems for candidate in problem.candidates)
+    assert all((demand.memory_bytes, demand.utilization) == (96, 1.0)
+               for problem in problems for demand in problem.candidates[0].demands)
+    plan = plan_pool(problems, [DeviceBudget(1000)] * ranks)
+    assert not plan.rejected
+    mapped = [rank for item in plan.placements for rank in item.rank_map]
+    assert sorted(mapped) == list(range(ranks))
+    assert [len(item.rank_map) for item in plan.placements] == sizes
+
+
+def test_equal_split_missing_profile_is_unknown_and_does_not_substitute_a_layout():
+    profiles = [profile("stage_equal", 2), profile("virtual_rank", 3)]
+    assert bench.equal_problems(profiles, ranks=7, count=3, slo_ms=100) is None
+    missing = profile("stage_equal", 3)
+    missing["status"] = "unverified_memory"
+    assert bench.equal_problems([*profiles, missing], ranks=7, count=3, slo_ms=100) is None
+
+
+def test_equal_split_profile_missing_does_not_block_larger_counts(monkeypatch, tmp_path):
+    calls = []
+
+    def point(service, params, problems, budgets, args, path, trim, physical_budgets=None):
+        calls.append(path.stem)
+        return {"streams": len(problems), "status": "measured", "qualified": True, "steady_slo_pass": True}
+
+    monkeypatch.setattr(bench, "run_point", point)
+    args = SimpleNamespace(max_batch_size=4, max_streams=2, slo_ms=100, seed=1)
+    profiles = [profile("stage_equal", 1)]
+    result = bench.search_capacity(None, None, [DeviceBudget(1000)] * 2, profiles,
+                                   [[1, 2, 3, 4]], args, tmp_path, trim=2)
+    exclusive = result["stage_equal_exclusive"]
+    assert exclusive["points"][0]["status"] == "unverified_profile"
+    assert "qualified" not in exclusive["points"][0]
+    assert exclusive["unverified_points"] == [1]
+    assert exclusive["largest_verified_streams"] == 2
+    assert "stage_equal_exclusive-streams1" not in calls
+    assert "stage_equal_exclusive-streams2" in calls
+    assert exclusive["points"][0]["evaluation_order"] == ["stage_equal_exclusive", "stage_equal", "virtual_rank"]
 
 
 def test_extending_overlap_does_not_erase_an_observed_slo_violation(tmp_path):

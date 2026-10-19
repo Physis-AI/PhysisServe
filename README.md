@@ -107,6 +107,8 @@ python bench.py Physis-AI/physisserve-wan2p1_1p3b-same_step-sdv2 \
 
 Raw measurements and placement decisions are saved under `bench-results/`; use `--resume PATH` with the same arguments after interruption. SLO qualification includes bootstrap gaps; resource estimates alone never qualify a stream count. Search limits and unverified points are reported explicitly.
 
+Capacity results include equally split, exclusive-GPU StageEqual, pooled StageEqual, and pooled VirtualRank to separate allocation and scheduling gains.
+
 ## Roadmap
 
 - [ ] Gradually evolve the engine into a video generation serving system.

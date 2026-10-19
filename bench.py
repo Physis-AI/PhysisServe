@@ -512,36 +512,83 @@ def measured_candidates(profiles, method, costs, args, idle_bytes=0):
             for profile in profiles if profile["method"] == method and profile["status"] == "measured"]
 
 
+def equal_problems(profiles, ranks, count, slo_ms, idle_bytes=0):
+    """Equal GPU counts per stream, with no sharing between streams.
+
+    Utilization 1 reserves an exclusive GPU; it is not a compute estimate.
+    Memory comes from the same profiles/margins as pooling. Do not screen by
+    isolated latency: the concurrent run must determine whether the SLO holds.
+    None means a required profile is unverified, not an observed failure.
+    """
+    if count > ranks:
+        return problems_for([], count, slo_ms)
+    quotient, remainder = divmod(ranks, count)
+    sizes = [quotient + (index < remainder) for index in range(count)]
+    measured = {profile["ranks"]: profile for profile in profiles
+                if profile["method"] == "stage_equal" and profile["status"] == "measured"}
+    if not set(sizes) <= measured.keys():
+        return None
+    problems = []
+    for index, size in enumerate(sizes):
+        demands = tuple(RankDemand(max(1, ceil((row["peak_bytes"] - idle_bytes) * 1.2)), 1.0)
+                        for row in measured[size]["demands"])
+        candidate = Candidate(f"stage_equal-exclusive-r{size}", StageEqual(size), demands, 0.0)
+        problems.append(StreamCandidates(str(index), slo_ms, (candidate,)))
+    return tuple(problems)
+
+
 def search_capacity(service, params, budgets, profiles, costs, args, directory, trim):
-    result = {}
     # Even an unmapped rank loads the stream's small shared modules. Reserve
     # that measured footprint on every GPU, then charge active stages extra.
     idle_bytes = max((profile.get("idle_peak_bytes", 0) for profile in profiles), default=0)
-    for method in ("stage_equal", "virtual_rank"):
-        candidates = measured_candidates(profiles, method, costs, args, idle_bytes)
-        points, stop = [], "stream_limit"
-        for count in range(1, args.max_streams + 1):
+    methods = ("stage_equal_exclusive", "stage_equal", "virtual_rank")
+    candidates = {method: measured_candidates(profiles, method, costs, args, idle_bytes)
+                  for method in methods[1:]}
+    result = {method: {"largest_verified_streams": 0, "largest_steady_only_streams": 0,
+                       "stop_reason": "stream_limit", "points": [], "ceiling_reached": False,
+                       "idle_bytes_per_stream_per_gpu": idle_bytes,
+                       "unverified_profiles": [p["name"] for p in profiles
+                           if p["method"] == ("stage_equal" if method == "stage_equal_exclusive" else method)
+                           and p["status"] != "measured"], "unverified_points": []}
+              for method in methods}
+    for count in range(1, args.max_streams + 1):
+        # Interleave methods at each count; reverse by count and seed so one
+        # method is not always measured after the others have warmed the GPUs.
+        order = methods[::-1] if (count + args.seed) % 2 else methods
+        available = tuple(DeviceBudget(max(1, item.memory_bytes - ceil(idle_bytes * 1.2) * count), item.utilization)
+                          for item in budgets)
+        for method in order:
+            record = result[method]
+            if record["stop_reason"] != "stream_limit":
+                continue
             print(f"Testing {method}, {count} stream(s)", flush=True)
-            available = tuple(DeviceBudget(max(1, item.memory_bytes - ceil(idle_bytes * 1.2) * count), item.utilization)
-                              for item in budgets)
-            point = run_point(service, params, problems_for(candidates, count, args.slo_ms), available, args,
-                              directory / f"{method}-streams{count}.json", trim, physical_budgets=budgets)
-            points.append({key: value for key, value in point.items() if key not in ("attempts", "preflight")})
-            # A larger count changes the reserved idle footprint and can select
-            # another layout. Neither SLO nor placement failures are monotonic.
-            if not candidates and point["status"] == "not_admitted":
-                stop = "not_admitted"
-                break
-        result[method] = {"largest_verified_streams": max((p["streams"] for p in points if p.get("qualified")), default=0),
-                          "largest_steady_only_streams": max((p["streams"] for p in points if p.get("steady_slo_pass")), default=0),
-                          "stop_reason": stop, "points": points,
-                          "idle_bytes_per_stream_per_gpu": idle_bytes,
-                          "unverified_profiles": [p["name"] for p in profiles if p["method"] == method and p["status"] != "measured"]}
-        result[method]["ceiling_reached"] = stop == "stream_limit"
-        result[method]["unverified_points"] = [p["streams"] for p in points
-                                               if p["status"] in ("unverified_memory", "unstable", "insufficient_overlap")]
-        save(directory / "capacity.json", result)
-        print(f"{method}: largest verified = {result[method]['largest_verified_streams']}, stop = {stop}", flush=True)
+            path = directory / f"{method}-streams{count}.json"
+            exclusive = method == "stage_equal_exclusive"
+            problems = (equal_problems(profiles, len(budgets), count, args.slo_ms, idle_bytes) if exclusive
+                        else problems_for(candidates[method], count, args.slo_ms))
+            if problems is None:
+                point = {"streams": count, "status": "unverified_profile",
+                         "reason": "the equal GPU split requires an unverified StageEqual profile"}
+            else:
+                point = run_point(service, params, problems, available, args, path, trim, physical_budgets=budgets)
+            point["evaluation_order"] = list(order)
+            if exclusive and count > len(budgets):
+                point["reason"] = "exclusive equal splitting requires at least one GPU per stream"
+                record["stop_reason"] = "not_admitted"
+            elif not exclusive and not candidates[method] and point["status"] == "not_admitted":
+                record["stop_reason"] = "not_admitted"
+            # Other failures are not monotonic: changing the stream count can
+            # change both the available memory and the selected layouts.
+            save(path, point)
+            record["points"].append({key: value for key, value in point.items() if key not in ("attempts", "preflight")})
+            record["largest_verified_streams"] = max((p["streams"] for p in record["points"] if p.get("qualified")), default=0)
+            record["largest_steady_only_streams"] = max((p["streams"] for p in record["points"] if p.get("steady_slo_pass")), default=0)
+            record["ceiling_reached"] = count == args.max_streams and record["stop_reason"] == "stream_limit"
+            record["unverified_points"] = [p["streams"] for p in record["points"] if p["status"] in
+                                           ("unverified_profile", "unverified_memory", "unstable", "insufficient_overlap")]
+            save(directory / "capacity.json", result)
+    for method, record in result.items():
+        print(f"{method}: largest verified = {record['largest_verified_streams']}, stop = {record['stop_reason']}", flush=True)
     return result
 
 
@@ -618,6 +665,8 @@ def main():
                       "protocol": {"trim_chunks": trim, "initial_chunks": chunks, "memory_fraction": 0.8,
                                    "demand_margin": 1.2, "max_half_drift": 0.05, "extension_attempts": 3,
                                    "profile_ranks": list(range(1, config.ranks + 1)),
+                                   "capacity_order": "exclusive StageEqual, pooled StageEqual, pooled VirtualRank; reversed when (stream count + seed) is odd",
+                                   "exclusive_baseline": "divmod(pool GPUs, streams), disjoint GPUs; utilization=1 is reservation, not measured compute",
                                    "calibration": "real native blocks, random full-history KV fixtures; 3 warmups, 12 samples/cell",
                                    "weight_identity": "model path and config hashes; tensor payloads are not hashed"}}
         report["status"] = "running"
