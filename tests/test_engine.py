@@ -325,7 +325,7 @@ def test_failed_callback_closes_stream_iterators_before_reuse(monkeypatch):
     assert len(engine.run()) == 2
 
 
-def distributed_worker(rank, rendezvous):
+def distributed_worker(rank, rendezvous, optimized):
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2,
                             timeout=timedelta(seconds=30))
     try:
@@ -335,11 +335,25 @@ def distributed_worker(rank, rendezvous):
         candidate = Candidate("one", StageEqual(1), (RankDemand(1, 0.1),), 1.0)
         candidates = [StreamCandidates(str(index), 2.0, (candidate,)) for index in range(2)]
         prompts, params = inputs()
+        if optimized:
+            small = Candidate("one", StageEqual(1), (RankDemand(1, 0.1),), 2.0, 2.0)
+            fast = Candidate("two", StageEqual(2), (RankDemand(1, 0.1),) * 2, 1.0, 1.0)
+            if optimized == "upgrade":
+                prompts, params = prompts[:1], params[:1]
+            candidates = [StreamCandidates(str(index), 2.0, (small, fast)) for index in range(len(prompts))]
         engine.prepare(prompts, params, candidates, [DeviceBudget(10), DeviceBudget(2)])
-        assert all(runner.layout.rank_map == (1,) for _, runner in engine.runners.values())
+        if optimized:
+            assert sorted(rank for _, runner in engine.runners.values() for rank in runner.layout.rank_map) == [0, 1]
+            assert [len(runner.layout.rank_map) for _, runner in engine.runners.values()] == (
+                [2] if optimized == "upgrade" else [1, 1])
+        else:
+            assert all(runner.layout.rank_map == (1,) for _, runner in engine.runners.values())
+        # All remapping precedes inference; neither run may replan live KV homes.
+        import physisserve.engine.engine as engine_module
+        engine_module.plan_pool = lambda *args: pytest.fail("inference must not replan")
         results = engine.run()
         if rank == 0:
-            assert len(results) == 2
+            assert len(results) == len(prompts)
             for prompt, param, result in zip(prompts, params, results):
                 reference = FakeDiT(FakeConfig())
                 from tests.reference import run
@@ -347,23 +361,27 @@ def distributed_worker(rank, rendezvous):
                 shape = (1, config.channels, 1, param.height, param.width)
                 expected = run(reference, config.make_sampler(), condition, shape, param.num_chunks, seed=param.seed)
                 torch.testing.assert_close(result["latents"], expected, rtol=0, atol=0)
-            assert all(not dit.loaded for dit in config.loaded)
+            if not optimized:
+                assert all(not dit.loaded for dit in config.loaded)
         else:
             assert results is None
         produced, delivered = [], []
         assert engine.run(on_latent=lambda index, chunk, latent: produced.append((index, chunk)),
                           on_output=lambda index, chunk, latent: delivered.append((index, chunk)),
                           return_outputs=False) is None
-        observed = delivered if rank == 0 else produced
-        assert not (produced if rank == 0 else delivered)
-        for index, param in enumerate(params):
-            assert [chunk for stream, chunk in observed if stream == index] == list(range(param.num_chunks))
+        if rank == 0 or not optimized:
+            observed = delivered if rank == 0 else produced
+            for index, param in enumerate(params):
+                assert [chunk for stream, chunk in observed if stream == index] == list(range(param.num_chunks))
+        if rank != 0 or not optimized:
+            assert not (produced if rank == 0 else delivered)
     finally:
         dist.destroy_process_group()
 
 
-def test_distributed_output_rank_without_compute_blocks(tmp_path):
-    context = mp.spawn(distributed_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=False)
+@pytest.mark.parametrize("optimized", [None, "spread", "upgrade"])
+def test_distributed_placement_matches_single_stream_without_runtime_remapping(tmp_path, optimized):
+    context = mp.spawn(distributed_worker, args=(str(tmp_path / "rendezvous"), optimized), nprocs=2, join=False)
     try:
         # spawn.join can return after a single child exits; wait once per child.
         for _ in range(3):

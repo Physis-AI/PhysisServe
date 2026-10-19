@@ -270,7 +270,7 @@ def test_both_methods_use_measured_resource_demands_not_exclusive_gpu_reservatio
     profiles = [{"name": f"{method}-r2", "method": method, "ranks": 2, "status": "measured",
                  "demands": [{"peak_bytes": 10, "compute_ms_per_chunk": 25},
                              {"peak_bytes": 20, "compute_ms_per_chunk": 50}],
-                 "summary": {"max_gap_ms": 10, "all_max_gap_ms": 200, "strict_slo_pass": False}}
+                 "summary": {"max_gap_ms": 10, "chunk_gap_ms": 7, "all_max_gap_ms": 200, "strict_slo_pass": False}}
                 for method in ("stage_equal", "virtual_rank")]
     profiles.append({"name": "stage_equal-r1", "method": "stage_equal", "status": "unverified_memory"})
     for method in ("stage_equal", "virtual_rank"):
@@ -279,6 +279,7 @@ def test_both_methods_use_measured_resource_demands_not_exclusive_gpu_reservatio
         assert [demand.memory_bytes for demand in candidates[0].demands] == [12, 24]
         assert [demand.utilization for demand in candidates[0].demands] == pytest.approx([0.3, 0.6])
         assert candidates[0].max_gap_ms == 10
+        assert candidates[0].mean_gap_ms == 7
 
 
 def test_capacity_search_does_not_assume_slo_passes_are_monotonic(monkeypatch, tmp_path):
@@ -326,7 +327,7 @@ def test_placement_failure_is_unknown_not_a_measured_slo_failure(monkeypatch, tm
 def profile(method, ranks):
     return {"name": f"{method}-r{ranks}", "method": method, "ranks": ranks, "status": "measured",
             "demands": [{"peak_bytes": 100, "compute_ms_per_chunk": 20}] * ranks,
-            "summary": {"max_gap_ms": 200}}
+            "summary": {"max_gap_ms": 200, "chunk_gap_ms": 100}}
 
 
 @pytest.mark.parametrize("ranks,count,sizes", [(7, 3, [3, 2, 2]), (8, 2, [4, 4]), (3, 3, [1, 1, 1])])
@@ -335,6 +336,7 @@ def test_equal_split_uses_all_gpus_disjointly_without_isolated_slo_screen(ranks,
     problems = bench.equal_problems(profiles, ranks, count, slo_ms=100, idle_bytes=20)
     assert [len(problem.candidates[0].demands) for problem in problems] == sizes
     assert all(candidate.max_gap_ms == 0 for problem in problems for candidate in problem.candidates)
+    assert all(candidate.mean_gap_ms is None for problem in problems for candidate in problem.candidates)
     assert all((demand.memory_bytes, demand.utilization) == (96, 1.0)
                for problem in problems for demand in problem.candidates[0].demands)
     plan = plan_pool(problems, [DeviceBudget(1000)] * ranks)

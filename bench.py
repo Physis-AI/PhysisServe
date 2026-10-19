@@ -508,7 +508,8 @@ def measured_candidates(profiles, method, costs, args, idle_bytes=0):
     return [Candidate(profile["name"], make_layout(method, profile["ranks"], costs, args.max_batch_size),
                       tuple(RankDemand(max(1, ceil((row["peak_bytes"] - idle_bytes) * 1.2)),
                                        row["compute_ms_per_chunk"] * 1.2 / args.slo_ms)
-                            for row in profile["demands"]), profile["summary"]["max_gap_ms"])
+                            for row in profile["demands"]), profile["summary"]["max_gap_ms"],
+                      profile["summary"]["chunk_gap_ms"])
             for profile in profiles if profile["method"] == method and profile["status"] == "measured"]
 
 

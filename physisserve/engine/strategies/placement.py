@@ -26,6 +26,7 @@ class Candidate:
     layout: StageEqual | VirtualRank
     demands: tuple[RankDemand, ...]
     max_gap_ms: float | None = None
+    mean_gap_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -78,14 +79,14 @@ class _Search:
         return True
 
 
-def _pooled_map(candidate, loads, budgets, discrepancies, search):
+def _pooled_map(candidate, loads, budgets, discrepancies, search, distinct=False):
     """Best-Fit ordering with LDS over selected option positions.
 
     At each item, option 0 is the current best-fit choice. Option j consumes
     j discrepancies. Prior streams are immutable; all tentative current-stream
     work stays in this function and is discarded on failure.
     """
-    if not budgets:
+    if not budgets or (distinct and len(candidate.demands) > len(budgets)):
         return None
     work = list(loads)
     rank_map = [-1] * len(candidate.demands)
@@ -100,7 +101,8 @@ def _pooled_map(candidate, loads, budgets, discrepancies, search):
             return tuple(rank_map)
         local_rank = order[position]
         demand = candidate.demands[local_rank]
-        options = [rank for rank, budget in enumerate(budgets) if _fits(work[rank], demand, budget)]
+        options = [rank for rank, budget in enumerate(budgets)
+                   if (not distinct or rank not in rank_map) and _fits(work[rank], demand, budget)]
         options.sort(key=lambda rank: (
             (budgets[rank].memory_bytes - work[rank].memory_bytes - demand.memory_bytes)
             / budgets[rank].memory_bytes
@@ -126,13 +128,55 @@ def _pooled_map(candidate, loads, budgets, discrepancies, search):
     return place(0, discrepancies)
 
 
+def _use_spare_gpus(problems, placements, budgets, discrepancies, search):
+    """Improve a complete plan before loading weights, without displacing peers.
+
+    Isolate measured layouts first, then greedily buy measured throughput per
+    additional GPU. Standalone timings only rank choices: pooled SLO and speed
+    still need measurement, particularly after changing physical topology.
+    """
+    choices = {problem.stream_id: _eligible(problem) for problem in problems}
+    while not search.exhausted:
+        best, best_score = None, None
+        for index, item in enumerate(placements):
+            current = item.candidate
+            if current.mean_gap_ms is None:
+                continue
+            occupied = {rank for peer in placements if peer is not item for rank in peer.rank_map}
+            free = [rank for rank in range(len(budgets)) if rank not in occupied]
+            own = set(item.rank_map)
+            isolated = len(own) == len(current.demands) and own.isdisjoint(occupied)
+            for candidate in choices[item.stream_id]:
+                spread = candidate is current and not isolated
+                if candidate.mean_gap_ms is None or (candidate.mean_gap_ms >= current.mean_gap_ms and not spread):
+                    continue
+                extra = len(candidate.demands) - len(own - occupied)
+                gain = 1 / candidate.mean_gap_ms - 1 / current.mean_gap_ms
+                score = (spread, extra <= 0, gain / max(1, extra), gain)
+                if best_score is not None and score <= best_score:
+                    continue
+                mapping = _pooled_map(candidate, [RankDemand(0, 0.0)] * len(free),
+                                      [budgets[rank] for rank in free], discrepancies, search, distinct=True)
+                if mapping is not None:
+                    best = index, StreamPlacement(item.stream_id, candidate, tuple(free[rank] for rank in mapping))
+                    best_score = score
+                if search.exhausted:
+                    break
+            if search.exhausted:
+                break
+        if best is None:
+            break
+        index, replacement = best
+        placements[index] = replacement
+
+
 def plan_pool(problems: Sequence[StreamCandidates], budgets: Sequence[DeviceBudget],
               lds_discrepancies=2, search_limit=10000) -> PoolPlan:
-    """Place arrivals without moving accepted streams. Demands are summed per GPU.
+    """Admit streams compactly, then spend spare GPUs on measured faster layouts.
 
-    Internal candidates contain measured max_gap_ms and per-rank demands.
-    Pooled execution must still be measured against the delivery target.
-    Search is bounded per arrival; unsuccessful arrivals leave loads unchanged.
+    Admission is unchanged by optimization; no accepted stream is evicted.
+    Everything happens before inference, not through live KV migration. Search
+    is bounded per arrival and for the final whole-plan improvement pass.
     """
     budgets = tuple(budgets)
     loads = [RankDemand(0, 0.0) for _ in budgets]
@@ -161,11 +205,19 @@ def plan_pool(problems: Sequence[StreamCandidates], budgets: Sequence[DeviceBudg
         placements.append(StreamPlacement(problem.stream_id, selected, rank_map))
         for demand, rank in zip(selected.demands, rank_map):
             loads[rank] = _add(loads[rank], demand)
+    improvement = _Search(search_limit)
+    if not rejected:
+        _use_spare_gpus(problems, placements, budgets, lds_discrepancies, improvement)
+        loads = [RankDemand(0, 0.0) for _ in budgets]
+        for item in placements:
+            for demand, rank in zip(item.candidate.demands, item.rank_map):
+                loads[rank] = _add(loads[rank], demand)
     return PoolPlan(tuple(placements), rejected, tuple(loads), {
         "global_slo_verified": False,
         "search_limit_per_stream": search_limit,
         "lds_discrepancies": lds_discrepancies,
         "search": searches,
+        "spare_gpu_search": dict(nodes=improvement.nodes, exhausted=improvement.exhausted),
     })
 
 

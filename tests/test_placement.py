@@ -6,8 +6,8 @@ from physisserve.engine.strategies.placement import (
 )
 
 
-def candidate(name, demands, gap=10):
-    return Candidate(name, StageEqual(len(demands)), tuple(RankDemand(*item) for item in demands), gap)
+def candidate(name, demands, gap=10, mean=None):
+    return Candidate(name, StageEqual(len(demands)), tuple(RankDemand(*item) for item in demands), gap, mean)
 
 
 def problem(name, *candidates):
@@ -97,6 +97,57 @@ def test_candidate_names_do_not_restrict_search(name):
     assert plan.diagnostics["search"]["p"]["tried_candidates"] == (name, name)
 
 
+def test_two_streams_use_seven_gpus_when_measured_layouts_benefit():
+    choices = tuple(candidate(f"r{ranks}", [(6, 0.25)] * ranks, mean=mean)
+                    for ranks, mean in ((1, 12), (3, 4.2), (4, 3.4)))
+    arrivals = [problem(str(index), *choices) for index in range(2)]
+    budgets = [DeviceBudget(10)] * 7
+    plan = plan_pool(arrivals, budgets)
+    assert not plan.rejected
+    assert [len(item.rank_map) for item in plan.placements] == [4, 3]
+    assert sorted(rank for item in plan.placements for rank in item.rank_map) == list(range(7))
+    assert all(load == RankDemand(6, 0.25) for load in plan.loads)
+    assert plan == plan_pool(arrivals, budgets)
+
+
+@pytest.mark.parametrize("gpus,accepted", [(1, 1), (3, 2)])
+def test_fast_layout_never_evicts_an_admitted_stream(gpus, accepted):
+    choices = (candidate("small", [(6, 0.2)], mean=10),
+               candidate("fast", [(6, 0.2)] * 3, mean=2))
+    plan = plan_pool([problem(str(index), *choices) for index in range(2)], [DeviceBudget(10)] * gpus)
+    assert len(plan.placements) == accepted and len(plan.rejected) == 2 - accepted
+    assert all(item.candidate is choices[0] for item in plan.placements)
+
+
+def test_spare_gpus_spread_measured_coalesced_and_shared_ranks():
+    choice = candidate("two", [(2, 0.1)] * 2, mean=10)
+    plan = plan_pool([problem(str(index), choice) for index in range(2)], [DeviceBudget(10)] * 4)
+    assert sorted(rank for item in plan.placements for rank in item.rank_map) == list(range(4))
+    assert all(item.candidate is choice for item in plan.placements)
+    assert plan.loads == (RankDemand(2, 0.1),) * 4
+
+
+def test_spare_gpu_search_exhaustion_keeps_the_admitted_plan():
+    small = candidate("small", [(6, 0.2)], mean=10)
+    fast = candidate("fast", [(6, 0.2)] * 2, mean=2)
+    plan = plan_pool([problem("p", small, fast)], [DeviceBudget(10)] * 3, search_limit=1)
+    assert not plan.rejected and plan.placements[0].candidate is small
+    assert plan.loads == (RankDemand(6, 0.2), RankDemand(0, 0.0), RankDemand(0, 0.0))
+    assert plan.diagnostics["spare_gpu_search"] == {"nodes": 1, "exhausted": True}
+
+
+@pytest.mark.parametrize("case", ["memory", "slo", "slower", "unknown", "unprofiled"])
+def test_spare_gpus_do_not_justify_an_unverified_or_worse_upgrade(case):
+    small = candidate("small", [(6, 0.2)], mean=None if case == "unprofiled" else 10)
+    larger = candidate("larger", [(11 if case == "memory" else 6, 0.2)] * 2,
+                       gap=21 if case == "slo" else 10,
+                       mean=None if case == "unknown" else 11 if case == "slower" else 2)
+    plan = plan_pool([problem("p", small, larger)], [DeviceBudget(10)] * 3)
+    assert plan.placements[0].candidate is small
+    assert plan.placements[0].rank_map == (0,)
+    assert plan.loads == (RankDemand(6, 0.2), RankDemand(0, 0.0), RankDemand(0, 0.0))
+
+
 @pytest.mark.parametrize("ranks,discrepancies,search_limit", [
     (ranks, discrepancies, search_limit)
     for ranks in [1, 2, 5] for search_limit in [0, 1, 7, 10000]
@@ -105,8 +156,8 @@ def test_candidate_names_do_not_restrict_search(name):
 def test_generated_placement_covers_arrivals_and_obeys_resource_and_search_budgets(
         ranks, discrepancies, search_limit):
     arrivals = [problem(str(index),
-                        candidate("", [(2 + index % 3, 0.125)] * (1 + index % 4)),
-                        candidate("", [(3 + index % 3, 0.25)] * (1 + index % 3)),
+                        candidate("", [(2 + index % 3, 0.125)] * (1 + index % 4), mean=8),
+                        candidate("", [(3 + index % 3, 0.25)] * (1 + index % 3), mean=4),
                         candidate("too-slow", [(1, 0.01)], 21))
                 for index in range(9)]
     budgets = [DeviceBudget(8 + rank, 0.75) for rank in range(ranks)]
@@ -131,3 +182,4 @@ def test_generated_placement_covers_arrivals_and_obeys_resource_and_search_budge
         assert load.utilization == expected_utilization[rank] <= budget.utilization
     for search in plan.diagnostics["search"].values():
         assert 0 <= search["nodes"] <= search_limit
+    assert 0 <= plan.diagnostics["spare_gpu_search"]["nodes"] <= search_limit
