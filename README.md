@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="https://github.com/Physis-AI/PhysisServe">
+    <img src="assets/logo.png" alt="PhysisServe" width="180">
+  </a>
+</p>
+
 # PhysisServe
 
 A lightweight inference engine for autoregressive video diffusion.
