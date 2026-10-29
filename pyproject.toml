@@ -41,5 +41,8 @@ dev = ["pytest>=8"]
 [tool.setuptools.packages.find]
 include = ["physisserve*"]
 
+[tool.setuptools.package-data]
+physisserve = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

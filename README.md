@@ -29,6 +29,20 @@ Use Python 3.10+ and a CUDA-enabled PyTorch installation. From the repository ro
 pip install -e .
 ```
 
+## Development
+
+The test suite runs on CPU: the distributed and model paths are exercised with
+in-process fakes, so no GPU or checkpoints are downloaded. Install the dev extra
+and run pytest:
+
+```bash
+pip install -e ".[dev]"
+pytest -q
+```
+
+The package ships a `py.typed` marker, so type checkers see the annotations
+in downstream projects.
+
 ## Supported Models
 
 The following model releases use Diffusers format and support same-step noisy-KV inference.

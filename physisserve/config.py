@@ -55,7 +55,7 @@ class Config:
         if self.max_batch is None:
             self.max_batch = 1 if self.strategy == "stage_equal" else DENOISING_STEPS
         if type(self.max_batch) is not int or not 1 <= self.max_batch <= DENOISING_STEPS:
-            raise ValueError("max_batch_size must be an integer from 1 to 4")
+            raise ValueError(f"max_batch_size must be an integer from 1 to {DENOISING_STEPS}")
         if self.admission_window is not None and (type(self.admission_window) is not int or self.admission_window < 1):
             raise ValueError("admission_window must be a positive integer")
         if self.device not in ("cpu", "cuda") or self.encoder_device not in ("cpu", "cuda"):
