@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  # Deliberately not gating pushes to main yet: two cases in test_models.py
+  # compare a chunked decode against a whole-sequence decode with
+  # rtol=0, atol=0, which does not hold for floating point on CPU (they pass
+  # on GPU). Add the push trigger once that is resolved, so main does not go
+  # red the moment this lands.
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # torch and torchvision must come from the same index. torchvision is a
+      # hard dependency of the package, and the PyPI wheel is linked against
+      # CUDA; mixing it with a CPU torch makes `import torchvision` fail, which
+      # in turn breaks transformers' lazy imports.
+      - name: Install CPU PyTorch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install PhysisServe with dev extras
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest -q
